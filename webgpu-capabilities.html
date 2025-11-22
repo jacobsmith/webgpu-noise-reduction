@@ -1,0 +1,185 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>WebGPU Capabilities Checker</title>
+    <style>
+        body {
+            font-family: system-ui, -apple-system, sans-serif;
+            max-width: 900px;
+            margin: 40px auto;
+            padding: 0 20px;
+            line-height: 1.6;
+        }
+        h1 {
+            color: #333;
+        }
+        .section {
+            background: #f5f5f5;
+            padding: 20px;
+            margin: 20px 0;
+            border-radius: 8px;
+        }
+        .supported {
+            color: #22c55e;
+            font-weight: bold;
+        }
+        .not-supported {
+            color: #ef4444;
+            font-weight: bold;
+        }
+        .info-grid {
+            display: grid;
+            grid-template-columns: 200px 1fr;
+            gap: 10px;
+            margin-top: 10px;
+        }
+        .label {
+            font-weight: 600;
+            color: #666;
+        }
+        .value {
+            color: #333;
+        }
+        .features-list, .limits-list {
+            columns: 2;
+            margin-top: 10px;
+        }
+        .feature-item, .limit-item {
+            padding: 4px 0;
+            break-inside: avoid;
+        }
+        code {
+            background: #e5e5e5;
+            padding: 2px 6px;
+            border-radius: 3px;
+            font-size: 0.9em;
+        }
+    </style>
+</head>
+<body>
+    <h1>WebGPU Capabilities Checker</h1>
+
+    <div class="section">
+        <h2>Browser Information</h2>
+        <div id="browser-info"></div>
+    </div>
+
+    <div class="section">
+        <h2>WebGPU Support</h2>
+        <div id="webgpu-support"></div>
+    </div>
+
+    <div class="section">
+        <h2>GPU Adapter Information</h2>
+        <div id="adapter-info"></div>
+    </div>
+
+    <div class="section">
+        <h2>Supported Features</h2>
+        <div id="features-info"></div>
+    </div>
+
+    <div class="section">
+        <h2>Device Limits</h2>
+        <div id="limits-info"></div>
+    </div>
+
+    <script>
+        async function checkWebGPUCapabilities() {
+            // Display browser info
+            const browserInfo = document.getElementById('browser-info');
+            browserInfo.innerHTML = `
+                <div class="info-grid">
+                    <div class="label">User Agent:</div>
+                    <div class="value">${navigator.userAgent}</div>
+                    <div class="label">Platform:</div>
+                    <div class="value">${navigator.platform}</div>
+                </div>
+            `;
+
+            // Check WebGPU support
+            const supportDiv = document.getElementById('webgpu-support');
+
+            if (!navigator.gpu) {
+                supportDiv.innerHTML = `
+                    <p class="not-supported">❌ WebGPU is NOT supported in this browser</p>
+                    <p>WebGPU requires a modern browser. Try Chrome 113+, Edge 113+, or another Chromium-based browser.</p>
+                `;
+                document.getElementById('adapter-info').innerHTML = '<p>N/A</p>';
+                document.getElementById('features-info').innerHTML = '<p>N/A</p>';
+                document.getElementById('limits-info').innerHTML = '<p>N/A</p>';
+                return;
+            }
+
+            supportDiv.innerHTML = '<p class="supported">✅ WebGPU is supported!</p>';
+
+            try {
+                // Request adapter
+                const adapter = await navigator.gpu.requestAdapter();
+
+                if (!adapter) {
+                    document.getElementById('adapter-info').innerHTML = '<p class="not-supported">Failed to get GPU adapter</p>';
+                    return;
+                }
+
+                // Display adapter info
+                const adapterInfo = await adapter.requestAdapterInfo();
+                const adapterDiv = document.getElementById('adapter-info');
+                adapterDiv.innerHTML = `
+                    <div class="info-grid">
+                        <div class="label">Vendor:</div>
+                        <div class="value">${adapterInfo.vendor || 'Unknown'}</div>
+                        <div class="label">Architecture:</div>
+                        <div class="value">${adapterInfo.architecture || 'Unknown'}</div>
+                        <div class="label">Device:</div>
+                        <div class="value">${adapterInfo.device || 'Unknown'}</div>
+                        <div class="label">Description:</div>
+                        <div class="value">${adapterInfo.description || 'Unknown'}</div>
+                    </div>
+                `;
+
+                // Display features
+                const featuresDiv = document.getElementById('features-info');
+                const features = Array.from(adapter.features);
+                if (features.length > 0) {
+                    featuresDiv.innerHTML = `
+                        <p>This adapter supports <strong>${features.length}</strong> features:</p>
+                        <div class="features-list">
+                            ${features.map(f => `<div class="feature-item">• <code>${f}</code></div>`).join('')}
+                        </div>
+                    `;
+                } else {
+                    featuresDiv.innerHTML = '<p>No additional features supported</p>';
+                }
+
+                // Request device to get limits
+                const device = await adapter.requestDevice();
+
+                // Display limits
+                const limitsDiv = document.getElementById('limits-info');
+                const limits = device.limits;
+                const limitEntries = Object.entries(limits).sort((a, b) => a[0].localeCompare(b[0]));
+
+                limitsDiv.innerHTML = `
+                    <div class="limits-list">
+                        ${limitEntries.map(([key, value]) => `
+                            <div class="limit-item">
+                                <strong>${key}:</strong> ${value.toLocaleString()}
+                            </div>
+                        `).join('')}
+                    </div>
+                `;
+
+            } catch (error) {
+                console.error('Error checking WebGPU capabilities:', error);
+                document.getElementById('adapter-info').innerHTML = `<p class="not-supported">Error: ${error.message}</p>`;
+            }
+        }
+
+        // Run the check when page loads
+        checkWebGPUCapabilities();
+    </script>
+</body>
+</html>

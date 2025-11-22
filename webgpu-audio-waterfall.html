@@ -1,0 +1,650 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>WebGPU Audio Spectrum Waterfall</title>
+    <style>
+        body {
+            font-family: system-ui, -apple-system, sans-serif;
+            max-width: 1200px;
+            margin: 40px auto;
+            padding: 0 20px;
+            background: #1a1a1a;
+            color: #fff;
+        }
+        h1 {
+            color: #fff;
+        }
+        .controls {
+            background: #2a2a2a;
+            padding: 20px;
+            border-radius: 8px;
+            margin: 20px 0;
+        }
+        button {
+            padding: 12px 24px;
+            font-size: 16px;
+            background: #3b82f6;
+            color: white;
+            border: none;
+            border-radius: 6px;
+            cursor: pointer;
+            font-weight: 500;
+            margin-right: 10px;
+        }
+        button:hover:not(:disabled) {
+            background: #2563eb;
+        }
+        button:disabled {
+            background: #9ca3af;
+            cursor: not-allowed;
+        }
+        button.stop {
+            background: #ef4444;
+        }
+        button.stop:hover:not(:disabled) {
+            background: #dc2626;
+        }
+        #canvas {
+            display: block;
+            width: 100%;
+            max-width: 1024px;
+            height: 512px;
+            background: #000;
+            border-radius: 8px;
+            margin: 20px auto;
+        }
+        .status {
+            padding: 10px;
+            background: #374151;
+            border-radius: 4px;
+            margin-top: 10px;
+        }
+        .error {
+            color: #ef4444;
+            background: #fee;
+            padding: 10px;
+            border-radius: 4px;
+            margin: 10px 0;
+        }
+        .info {
+            background: #2a2a2a;
+            padding: 15px;
+            border-radius: 8px;
+            margin: 20px 0;
+            font-size: 14px;
+        }
+    </style>
+</head>
+<body>
+    <h1>WebGPU Audio Spectrum Waterfall</h1>
+
+    <div class="info">
+        <strong>Custom FFT Implementation - Speech Focused</strong><br>
+        Captures audio via Web Audio API AnalyserNode, then uses WebGPU compute shaders for custom FFT computation and real-time waterfall visualization.
+        <br><strong>Frequency range: 0 - 8,000 Hz</strong> (optimized for human speech)
+        <br>X-axis: Frequency bins | Y-axis: Time scrolling down
+    </div>
+
+    <div class="controls">
+        <button id="startBtn" onclick="start()">Start Microphone</button>
+        <button id="stopBtn" onclick="stop()" class="stop" disabled>Stop</button>
+        <div id="status" class="status">Click "Start Microphone" to begin</div>
+        <div id="debug" style="margin-top: 10px; font-family: monospace; font-size: 12px;"></div>
+    </div>
+
+    <canvas id="canvas" width="1024" height="512"></canvas>
+
+    <script>
+        const FFT_SIZE = 1024;
+        const WATERFALL_HEIGHT = 512;
+        const SAMPLE_RATE = 44100;
+
+        // Focus on human speech range: 0-8000 Hz instead of full 0-22050 Hz
+        const MAX_DISPLAY_FREQ = 4000; // Hz
+        const FREQ_PER_BIN = SAMPLE_RATE / FFT_SIZE; // ~86 Hz per bin
+        const WATERFALL_WIDTH = Math.floor(MAX_DISPLAY_FREQ / FREQ_PER_BIN); // ~186 bins for 0-8kHz
+
+        let device = null;
+        let context = null;
+        let renderPipeline = null;
+        let fftPipeline = null;
+        let scrollPipeline = null;
+
+        let audioContext = null;
+        let analyserNode = null;
+        let micStream = null;
+        let audioDataArray = null;
+
+        let waterfallTexture = null;
+        let audioBuffer = null;
+        let fftBuffer = null;
+        let paramsBuffer = null;
+
+        let animationId = null;
+        let isRunning = false;
+        let currentRow = 0;
+
+        async function initWebGPU() {
+            if (device) return true;
+
+            if (!navigator.gpu) {
+                showError('WebGPU is not supported in this browser');
+                return false;
+            }
+
+            try {
+                const adapter = await navigator.gpu.requestAdapter();
+                if (!adapter) {
+                    showError('Failed to get GPU adapter');
+                    return false;
+                }
+
+                device = await adapter.requestDevice();
+
+                const canvas = document.getElementById('canvas');
+                context = canvas.getContext('webgpu');
+
+                const presentationFormat = navigator.gpu.getPreferredCanvasFormat();
+                context.configure({
+                    device,
+                    format: presentationFormat,
+                });
+
+                await setupWebGPUResources();
+
+                console.log('WebGPU initialized successfully');
+                console.log('Waterfall texture:', WATERFALL_WIDTH, 'x', WATERFALL_HEIGHT);
+                console.log('FFT size:', FFT_SIZE);
+
+                return true;
+            } catch (error) {
+                showError('WebGPU initialization error: ' + error.message);
+                return false;
+            }
+        }
+
+        async function setupWebGPUResources() {
+            // Create waterfall texture (width = freq bins, height = time)
+            // Use rgba8unorm instead of r8unorm because it supports storage writes
+            waterfallTexture = device.createTexture({
+                size: [WATERFALL_WIDTH, WATERFALL_HEIGHT],
+                format: 'rgba8unorm',
+                usage: GPUTextureUsage.TEXTURE_BINDING |
+                       GPUTextureUsage.STORAGE_BINDING |
+                       GPUTextureUsage.COPY_DST
+            });
+
+            // Create buffers for audio data and FFT results
+            audioBuffer = device.createBuffer({
+                size: FFT_SIZE * 4, // Float32
+                usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST
+            });
+
+            fftBuffer = device.createBuffer({
+                size: FFT_SIZE * 2 * 4, // Complex numbers (real, imag)
+                usage: GPUBufferUsage.STORAGE
+            });
+
+            paramsBuffer = device.createBuffer({
+                size: 4, // u32 for current row
+                usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST
+            });
+
+            // Initialize texture with test pattern to verify rendering
+            const testData = new Uint8Array(WATERFALL_WIDTH * WATERFALL_HEIGHT * 4); // RGBA
+            for (let y = 0; y < WATERFALL_HEIGHT; y++) {
+                for (let x = 0; x < WATERFALL_WIDTH; x++) {
+                    const idx = (y * WATERFALL_WIDTH + x) * 4;
+                    const gradient = Math.floor((x / WATERFALL_WIDTH) * 255);
+                    testData[idx + 0] = gradient; // R
+                    testData[idx + 1] = gradient; // G
+                    testData[idx + 2] = gradient; // B
+                    testData[idx + 3] = 255;      // A
+                }
+            }
+            device.queue.writeTexture(
+                { texture: waterfallTexture },
+                testData,
+                { bytesPerRow: WATERFALL_WIDTH * 4 },
+                { width: WATERFALL_WIDTH, height: WATERFALL_HEIGHT }
+            );
+            console.log('Test pattern written to texture');
+
+            // Create pipelines
+            await createFFTPipeline();
+            await createScrollPipeline();
+            await createRenderPipeline();
+        }
+
+        async function createFFTPipeline() {
+            // Simple DFT for now (will be slow but functional)
+            // TODO: Implement Cooley-Tukey FFT for better performance
+            const fftShader = `
+                @group(0) @binding(0) var<storage, read> input: array<f32>;
+                @group(0) @binding(1) var<storage, read_write> output: array<vec2<f32>>;
+
+                const FFT_SIZE: u32 = ${FFT_SIZE};
+                const PI: f32 = 3.14159265359;
+
+                @compute @workgroup_size(64)
+                fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
+                    let k = global_id.x;
+                    if (k >= FFT_SIZE) {
+                        return;
+                    }
+
+                    var sum_real: f32 = 0.0;
+                    var sum_imag: f32 = 0.0;
+
+                    for (var n: u32 = 0; n < FFT_SIZE; n = n + 1) {
+                        let angle = -2.0 * PI * f32(k) * f32(n) / f32(FFT_SIZE);
+                        sum_real = sum_real + input[n] * cos(angle);
+                        sum_imag = sum_imag + input[n] * sin(angle);
+                    }
+
+                    output[k] = vec2<f32>(sum_real, sum_imag);
+                }
+            `;
+
+            try {
+                const module = device.createShaderModule({ code: fftShader });
+                console.log('FFT shader module created');
+
+                fftPipeline = device.createComputePipeline({
+                    layout: 'auto',
+                    compute: {
+                        module,
+                        entryPoint: 'main'
+                    }
+                });
+                console.log('FFT pipeline created');
+            } catch (error) {
+                console.error('FFT pipeline creation error:', error);
+                throw error;
+            }
+        }
+
+        async function createScrollPipeline() {
+            const scrollShader = `
+                @group(0) @binding(0) var waterfall: texture_storage_2d<rgba8unorm, write>;
+                @group(0) @binding(1) var<storage, read> magnitudes: array<vec2<f32>>;
+                @group(0) @binding(2) var<uniform> params: Params;
+
+                struct Params {
+                    currentRow: u32,
+                }
+
+                const WIDTH: u32 = ${WATERFALL_WIDTH};
+                const HEIGHT: u32 = ${WATERFALL_HEIGHT};
+
+                @compute @workgroup_size(64)
+                fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
+                    let x = global_id.x;
+
+                    if (x >= WIDTH) {
+                        return;
+                    }
+
+                    // Write new FFT data to current row
+                    let complex = magnitudes[x];
+                    let magnitude = sqrt(complex.x * complex.x + complex.y * complex.y);
+
+                    // Apply log scale for better visualization
+                    // Scale up the magnitude significantly before log
+                    let scaled = magnitude * 0.1;
+                    let normalized = log(1.0 + scaled) / log(100.0);
+                    let clamped = clamp(normalized, 0.0, 1.0);
+
+                    let row = params.currentRow % HEIGHT;
+                    // Store in red channel, green=0, blue=0, alpha=1
+                    textureStore(waterfall, vec2<i32>(i32(x), i32(row)), vec4<f32>(clamped, clamped, clamped, 1.0));
+                }
+            `;
+
+            try {
+                const module = device.createShaderModule({ code: scrollShader });
+                console.log('Scroll shader module created');
+
+                scrollPipeline = device.createComputePipeline({
+                    layout: 'auto',
+                    compute: {
+                        module,
+                        entryPoint: 'main'
+                    }
+                });
+                console.log('Scroll pipeline created');
+            } catch (error) {
+                console.error('Scroll pipeline creation error:', error);
+                throw error;
+            }
+        }
+
+        async function createRenderPipeline() {
+            const vertexShader = `
+                struct VertexOutput {
+                    @builtin(position) position: vec4<f32>,
+                    @location(0) uv: vec2<f32>,
+                }
+
+                @vertex
+                fn main(@builtin(vertex_index) vertex_index: u32) -> VertexOutput {
+                    var positions = array<vec2<f32>, 6>(
+                        vec2<f32>(-1.0, -1.0),
+                        vec2<f32>(1.0, -1.0),
+                        vec2<f32>(-1.0, 1.0),
+                        vec2<f32>(-1.0, 1.0),
+                        vec2<f32>(1.0, -1.0),
+                        vec2<f32>(1.0, 1.0)
+                    );
+
+                    var uvs = array<vec2<f32>, 6>(
+                        vec2<f32>(0.0, 1.0),
+                        vec2<f32>(1.0, 1.0),
+                        vec2<f32>(0.0, 0.0),
+                        vec2<f32>(0.0, 0.0),
+                        vec2<f32>(1.0, 1.0),
+                        vec2<f32>(1.0, 0.0)
+                    );
+
+                    var output: VertexOutput;
+                    output.position = vec4<f32>(positions[vertex_index], 0.0, 1.0);
+                    output.uv = uvs[vertex_index];
+                    return output;
+                }
+            `;
+
+            const fragmentShader = `
+                @group(0) @binding(0) var waterfallTexture: texture_2d<f32>;
+                @group(0) @binding(1) var waterfallSampler: sampler;
+                @group(0) @binding(2) var<uniform> params: Params;
+
+                struct Params {
+                    currentRow: u32,
+                }
+
+                const HEIGHT: f32 = ${WATERFALL_HEIGHT}.0;
+
+                @fragment
+                fn main(@location(0) uv: vec2<f32>) -> @location(0) vec4<f32> {
+                    // Offset UVs to create scrolling effect
+                    let rowOffset = f32(params.currentRow) / HEIGHT;
+                    var adjustedUV = uv;
+                    adjustedUV.y = fract(uv.y + rowOffset);
+
+                    let value = textureSample(waterfallTexture, waterfallSampler, adjustedUV).r;
+
+                    // Color mapping: viridis-like colors
+                    var color: vec3<f32>;
+                    if (value < 0.25) {
+                        color = mix(vec3<f32>(0.267, 0.005, 0.329), vec3<f32>(0.282, 0.141, 0.458), value * 4.0);
+                    } else if (value < 0.5) {
+                        color = mix(vec3<f32>(0.282, 0.141, 0.458), vec3<f32>(0.164, 0.471, 0.558), (value - 0.25) * 4.0);
+                    } else if (value < 0.75) {
+                        color = mix(vec3<f32>(0.164, 0.471, 0.558), vec3<f32>(0.478, 0.821, 0.318), (value - 0.5) * 4.0);
+                    } else {
+                        color = mix(vec3<f32>(0.478, 0.821, 0.318), vec3<f32>(0.993, 0.906, 0.144), (value - 0.75) * 4.0);
+                    }
+
+                    return vec4<f32>(color, 1.0);
+                }
+            `;
+
+            try {
+                const vertexModule = device.createShaderModule({ code: vertexShader });
+                console.log('Vertex shader module created');
+
+                const fragmentModule = device.createShaderModule({ code: fragmentShader });
+                console.log('Fragment shader module created');
+
+                const sampler = device.createSampler({
+                    magFilter: 'linear',
+                    minFilter: 'linear',
+                });
+
+                renderPipeline = device.createRenderPipeline({
+                    layout: 'auto',
+                    vertex: {
+                        module: vertexModule,
+                        entryPoint: 'main',
+                    },
+                    fragment: {
+                        module: fragmentModule,
+                        entryPoint: 'main',
+                        targets: [{
+                            format: navigator.gpu.getPreferredCanvasFormat(),
+                        }],
+                    },
+                    primitive: {
+                        topology: 'triangle-list',
+                    },
+                });
+                console.log('Render pipeline created');
+            } catch (error) {
+                console.error('Render pipeline creation error:', error);
+                throw error;
+            }
+        }
+
+        async function initAudio() {
+            try {
+                micStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+
+                audioContext = new AudioContext({ sampleRate: 44100 });
+
+                // Create AnalyserNode to get time-domain data
+                analyserNode = audioContext.createAnalyser();
+                analyserNode.fftSize = FFT_SIZE;
+
+                // Create buffer for time-domain data
+                audioDataArray = new Float32Array(FFT_SIZE);
+
+                const source = audioContext.createMediaStreamSource(micStream);
+                source.connect(analyserNode);
+
+                console.log('Audio initialized successfully');
+                console.log('Sample rate:', audioContext.sampleRate);
+                console.log('Analyser FFT size:', analyserNode.fftSize);
+
+                return true;
+            } catch (error) {
+                showError('Microphone access error: ' + error.message);
+                return false;
+            }
+        }
+
+        function processAudioData() {
+            if (!device || !analyserNode) return;
+
+            // Get time-domain data from analyser
+            analyserNode.getFloatTimeDomainData(audioDataArray);
+
+            // Debug: Check if we're getting audio data
+            const audioLevel = Math.max(...audioDataArray.map(Math.abs));
+            if (currentRow % 60 === 0) { // Log every 60 frames (~1 second)
+                console.log('Audio level:', audioLevel.toFixed(4), 'Current row:', currentRow);
+                console.log('Sample data (first 10):', Array.from(audioDataArray.slice(0, 10)).map(v => v.toFixed(3)));
+            }
+
+            // Update debug display
+            if (currentRow % 10 === 0) {
+                const debugDiv = document.getElementById('debug');
+                if (debugDiv) {
+                    debugDiv.textContent = `Audio Level: ${audioLevel.toFixed(4)} | Row: ${currentRow} | Frames: ${renderCount}`;
+                }
+            }
+
+            // Copy audio data to GPU buffer
+            device.queue.writeBuffer(audioBuffer, 0, audioDataArray);
+
+            // Update current row parameter
+            device.queue.writeBuffer(paramsBuffer, 0, new Uint32Array([currentRow]));
+
+            // Compute FFT and update waterfall
+            const commandEncoder = device.createCommandEncoder();
+
+            // Run FFT
+            const fftPass = commandEncoder.beginComputePass();
+            fftPass.setPipeline(fftPipeline);
+            const fftBindGroup = device.createBindGroup({
+                layout: fftPipeline.getBindGroupLayout(0),
+                entries: [
+                    { binding: 0, resource: { buffer: audioBuffer } },
+                    { binding: 1, resource: { buffer: fftBuffer } }
+                ]
+            });
+            fftPass.setBindGroup(0, fftBindGroup);
+            fftPass.dispatchWorkgroups(Math.ceil(FFT_SIZE / 64));
+            fftPass.end();
+
+            // Update waterfall texture
+            const scrollPass = commandEncoder.beginComputePass();
+            scrollPass.setPipeline(scrollPipeline);
+            const scrollBindGroup = device.createBindGroup({
+                layout: scrollPipeline.getBindGroupLayout(0),
+                entries: [
+                    { binding: 0, resource: waterfallTexture.createView() },
+                    { binding: 1, resource: { buffer: fftBuffer } },
+                    { binding: 2, resource: { buffer: paramsBuffer } }
+                ]
+            });
+            scrollPass.setBindGroup(0, scrollBindGroup);
+            scrollPass.dispatchWorkgroups(Math.ceil(WATERFALL_WIDTH / 64));
+            scrollPass.end();
+
+            device.queue.submit([commandEncoder.finish()]);
+
+            // Increment row for next frame
+            currentRow = (currentRow + 1) % WATERFALL_HEIGHT;
+        }
+
+        let renderCount = 0;
+
+        function render() {
+            if (!device || !context) {
+                console.error('Render called but device or context is null:', { device, context });
+                return;
+            }
+
+            renderCount++;
+            if (renderCount % 60 === 0) { // Log every 60 frames
+                console.log('Render frame:', renderCount, 'Canvas size:', context.canvas.width, 'x', context.canvas.height);
+            }
+
+            if (renderCount === 1) {
+                console.log('First render - context config:', {
+                    canvas: context.canvas,
+                    format: navigator.gpu.getPreferredCanvasFormat()
+                });
+            }
+
+            // Process audio data each frame
+            processAudioData();
+
+            try {
+                const commandEncoder = device.createCommandEncoder();
+                const textureView = context.getCurrentTexture().createView();
+
+                const renderPass = commandEncoder.beginRenderPass({
+                    colorAttachments: [{
+                        view: textureView,
+                        loadOp: 'clear',
+                        clearValue: { r: 0, g: 0, b: 0, a: 1 },
+                        storeOp: 'store',
+                    }],
+                });
+
+                const sampler = device.createSampler({
+                    magFilter: 'linear',
+                    minFilter: 'linear',
+                });
+
+                const renderBindGroup = device.createBindGroup({
+                    layout: renderPipeline.getBindGroupLayout(0),
+                    entries: [
+                        { binding: 0, resource: waterfallTexture.createView() },
+                        { binding: 1, resource: sampler },
+                        { binding: 2, resource: { buffer: paramsBuffer } }
+                    ]
+                });
+
+                renderPass.setPipeline(renderPipeline);
+                renderPass.setBindGroup(0, renderBindGroup);
+                renderPass.draw(6);
+                renderPass.end();
+
+                device.queue.submit([commandEncoder.finish()]);
+            } catch (error) {
+                console.error('Render error:', error);
+                isRunning = false;
+            }
+
+            if (isRunning) {
+                animationId = requestAnimationFrame(render);
+            }
+        }
+
+        async function start() {
+            showStatus('Initializing...');
+
+            document.getElementById('startBtn').disabled = true;
+
+            if (!await initWebGPU()) {
+                document.getElementById('startBtn').disabled = false;
+                return;
+            }
+
+            if (!await initAudio()) {
+                document.getElementById('startBtn').disabled = false;
+                return;
+            }
+
+            isRunning = true;
+            document.getElementById('stopBtn').disabled = false;
+            showStatus('Running - microphone active', true);
+
+            render();
+        }
+
+        function stop() {
+            isRunning = false;
+
+            if (animationId) {
+                cancelAnimationFrame(animationId);
+            }
+
+            if (analyserNode) {
+                analyserNode.disconnect();
+                analyserNode = null;
+            }
+
+            if (audioContext) {
+                audioContext.close();
+                audioContext = null;
+            }
+
+            if (micStream) {
+                micStream.getTracks().forEach(track => track.stop());
+                micStream = null;
+            }
+
+            document.getElementById('startBtn').disabled = false;
+            document.getElementById('stopBtn').disabled = true;
+            showStatus('Stopped');
+        }
+
+        function showStatus(message, isSuccess = false) {
+            const statusDiv = document.getElementById('status');
+            statusDiv.textContent = message;
+            statusDiv.style.color = isSuccess ? '#22c55e' : '#fff';
+            statusDiv.className = 'status';
+        }
+
+        function showError(message) {
+            const statusDiv = document.getElementById('status');
+            statusDiv.innerHTML = `<div class="error">${message}</div>`;
+        }
+    </script>
+</body>
+</html>

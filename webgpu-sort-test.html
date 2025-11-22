@@ -1,0 +1,426 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>WebGPU Sort Performance Test</title>
+    <style>
+        body {
+            font-family: system-ui, -apple-system, sans-serif;
+            max-width: 1000px;
+            margin: 40px auto;
+            padding: 0 20px;
+            line-height: 1.6;
+        }
+        h1 {
+            color: #333;
+        }
+        .controls {
+            background: #f5f5f5;
+            padding: 20px;
+            border-radius: 8px;
+            margin: 20px 0;
+        }
+        .button-group {
+            display: flex;
+            gap: 10px;
+            flex-wrap: wrap;
+            margin-top: 15px;
+        }
+        button {
+            padding: 12px 24px;
+            font-size: 16px;
+            background: #3b82f6;
+            color: white;
+            border: none;
+            border-radius: 6px;
+            cursor: pointer;
+            font-weight: 500;
+        }
+        button:hover:not(:disabled) {
+            background: #2563eb;
+        }
+        button:disabled {
+            background: #9ca3af;
+            cursor: not-allowed;
+        }
+        .results {
+            background: #f5f5f5;
+            padding: 20px;
+            border-radius: 8px;
+            margin: 20px 0;
+        }
+        .metric {
+            display: grid;
+            grid-template-columns: 250px 1fr;
+            gap: 10px;
+            padding: 8px 0;
+            border-bottom: 1px solid #e5e5e5;
+        }
+        .metric:last-child {
+            border-bottom: none;
+        }
+        .label {
+            font-weight: 600;
+            color: #666;
+        }
+        .value {
+            color: #333;
+            font-family: 'Courier New', monospace;
+        }
+        .error {
+            color: #ef4444;
+            padding: 10px;
+            background: #fee;
+            border-radius: 4px;
+            margin: 10px 0;
+        }
+        .success {
+            color: #22c55e;
+            font-weight: 600;
+        }
+        .status {
+            margin-top: 10px;
+            padding: 10px;
+            background: white;
+            border-radius: 4px;
+            font-weight: 500;
+        }
+    </style>
+</head>
+<body>
+    <h1>WebGPU Sort Performance Test</h1>
+
+    <div class="controls">
+        <h2>Test Configuration</h2>
+        <p>Sorting 1024 random floats using WebGPU compute shader (Parallel Bitonic Sort)</p>
+        <p><small>Note: GPU overhead is amortized by batching all iterations together before submission</small></p>
+
+        <div class="button-group">
+            <button onclick="runTest(1000)">1,000 iterations</button>
+            <button onclick="runTest(10000)">10,000 iterations</button>
+            <button onclick="runTest(100000)">100,000 iterations</button>
+            <button onclick="runTest(1000000)">1,000,000 iterations</button>
+        </div>
+
+        <div id="status" class="status"></div>
+    </div>
+
+    <div class="results">
+        <h2>Results</h2>
+        <div id="results-content">
+            <p>Click a button to run the test</p>
+        </div>
+    </div>
+
+    <script>
+        const ARRAY_SIZE = 100000;
+        let device = null;
+        let pipeline = null;
+        let bindGroupLayout = null;
+
+        const bitonicSortShader = `
+            @group(0) @binding(0) var<storage, read_write> data: array<f32>;
+
+            @compute @workgroup_size(256)
+            fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
+                let i = global_id.x;
+
+                // Bitonic sort is done in multiple passes
+                // This shader performs one comparison-swap step
+                // We'll need to dispatch it multiple times from JS
+            }
+
+            // Single step of bitonic sort
+            @compute @workgroup_size(256)
+            fn bitonic_step(
+                @builtin(global_invocation_id) global_id: vec3<u32>,
+                @builtin(num_workgroups) num_workgroups: vec3<u32>
+            ) {
+                let i = global_id.x;
+                if (i >= ${ARRAY_SIZE}) {
+                    return;
+                }
+            }
+        `;
+
+        // Parallel bitonic sort - each thread handles one comparison
+        const parallelBitonicSortShader = `
+            @group(0) @binding(0) var<storage, read_write> data: array<f32>;
+            @group(0) @binding(1) var<uniform> params: Params;
+
+            struct Params {
+                stage: u32,
+                step: u32,
+            }
+
+            const ARRAY_SIZE: u32 = ${ARRAY_SIZE};
+
+            @compute @workgroup_size(256)
+            fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
+                let i = global_id.x;
+                if (i >= ARRAY_SIZE) {
+                    return;
+                }
+
+                let stage = params.stage;
+                let step = params.step;
+
+                // Calculate partner index for comparison
+                let ixj = i ^ step;
+
+                if (ixj > i) {
+                    let ascending = (i & stage) == 0u;
+
+                    if ((ascending && data[i] > data[ixj]) || (!ascending && data[i] < data[ixj])) {
+                        // Swap
+                        let temp = data[i];
+                        data[i] = data[ixj];
+                        data[ixj] = temp;
+                    }
+                }
+            }
+        `;
+
+        async function initWebGPU() {
+            if (device) return true;
+
+            if (!navigator.gpu) {
+                showError('WebGPU is not supported in this browser');
+                return false;
+            }
+
+            try {
+                const adapter = await navigator.gpu.requestAdapter();
+                if (!adapter) {
+                    showError('Failed to get GPU adapter');
+                    return false;
+                }
+
+                device = await adapter.requestDevice();
+
+                // Create compute pipeline
+                const shaderModule = device.createShaderModule({
+                    code: parallelBitonicSortShader
+                });
+
+                bindGroupLayout = device.createBindGroupLayout({
+                    entries: [
+                        {
+                            binding: 0,
+                            visibility: GPUShaderStage.COMPUTE,
+                            buffer: { type: 'storage' }
+                        },
+                        {
+                            binding: 1,
+                            visibility: GPUShaderStage.COMPUTE,
+                            buffer: { type: 'uniform' }
+                        }
+                    ]
+                });
+
+                pipeline = device.createComputePipeline({
+                    layout: device.createPipelineLayout({
+                        bindGroupLayouts: [bindGroupLayout]
+                    }),
+                    compute: {
+                        module: shaderModule,
+                        entryPoint: 'main'
+                    }
+                });
+
+                return true;
+            } catch (error) {
+                showError('WebGPU initialization error: ' + error.message);
+                return false;
+            }
+        }
+
+        function generateRandomFloats(count) {
+            const arr = new Float32Array(count);
+            for (let i = 0; i < count; i++) {
+                arr[i] = Math.random() * 10000;
+            }
+            return arr;
+        }
+
+        function sortOnGPU(dataBuffer, paramsBuffer) {
+            const commandEncoder = device.createCommandEncoder();
+
+            // Bitonic sort requires log2(n) stages, each with multiple steps
+            const numStages = Math.log2(ARRAY_SIZE);
+
+            for (let stage = 0; stage < numStages; stage++) {
+                for (let step = stage; step >= 0; step--) {
+                    const stageSize = 1 << (stage + 1);
+                    const stepSize = 1 << step;
+
+                    // Update params buffer
+                    const paramsData = new Uint32Array([stageSize, stepSize]);
+                    device.queue.writeBuffer(paramsBuffer, 0, paramsData);
+
+                    // Create bind group for this pass
+                    const bindGroup = device.createBindGroup({
+                        layout: bindGroupLayout,
+                        entries: [
+                            {
+                                binding: 0,
+                                resource: { buffer: dataBuffer }
+                            },
+                            {
+                                binding: 1,
+                                resource: { buffer: paramsBuffer }
+                            }
+                        ]
+                    });
+
+                    // Execute one pass
+                    const passEncoder = commandEncoder.beginComputePass();
+                    passEncoder.setPipeline(pipeline);
+                    passEncoder.setBindGroup(0, bindGroup);
+                    passEncoder.dispatchWorkgroups(Math.ceil(ARRAY_SIZE / 256));
+                    passEncoder.end();
+                }
+            }
+
+            return commandEncoder.finish();
+        }
+
+        function sortOnCPU(data) {
+            const copy = new Float32Array(data);
+            copy.sort((a, b) => a - b);
+            return copy;
+        }
+
+        async function runTest(iterations) {
+            const buttons = document.querySelectorAll('button');
+            buttons.forEach(b => b.disabled = true);
+
+            showStatus(`Initializing WebGPU...`);
+
+            if (!await initWebGPU()) {
+                buttons.forEach(b => b.disabled = false);
+                return;
+            }
+
+            showStatus(`Running ${iterations.toLocaleString()} iterations...`);
+
+            // Generate test data once
+            const testData = generateRandomFloats(ARRAY_SIZE);
+
+            // Create GPU buffers (reused across iterations)
+            const dataBuffer = device.createBuffer({
+                size: testData.byteLength,
+                usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST
+            });
+
+            const paramsBuffer = device.createBuffer({
+                size: 8, // 2 x u32
+                usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST
+            });
+
+            // Initialize data buffer
+            device.queue.writeBuffer(dataBuffer, 0, testData);
+
+            // Run GPU test - batch all work together
+            const gpuStart = performance.now();
+            const commandBuffers = [];
+
+            for (let i = 0; i < iterations; i++) {
+                commandBuffers.push(sortOnGPU(dataBuffer, paramsBuffer));
+            }
+
+            // Submit all work at once and wait
+            device.queue.submit(commandBuffers);
+            await device.queue.onSubmittedWorkDone();
+
+            const gpuEnd = performance.now();
+            const gpuTime = gpuEnd - gpuStart;
+
+            // Clean up GPU buffers
+            dataBuffer.destroy();
+            paramsBuffer.destroy();
+
+            // Run CPU test (with fewer iterations for very large counts)
+            const cpuIterations = Math.min(iterations, 10000);
+            showStatus(`Running CPU baseline (${cpuIterations.toLocaleString()} iterations)...`);
+
+            const cpuStart = performance.now();
+            for (let i = 0; i < cpuIterations; i++) {
+                sortOnCPU(testData);
+            }
+            const cpuEnd = performance.now();
+            const cpuTime = cpuEnd - cpuStart;
+
+            // Calculate metrics
+            const gpuTimePerIteration = gpuTime / iterations;
+            const cpuTimePerIteration = cpuTime / cpuIterations;
+            const speedup = cpuTimePerIteration / gpuTimePerIteration;
+
+            // Display results
+            displayResults({
+                iterations,
+                arraySize: ARRAY_SIZE,
+                gpuTotalTime: gpuTime,
+                gpuTimePerIteration,
+                cpuTotalTime: cpuTime,
+                cpuTimePerIteration,
+                cpuIterations,
+                speedup
+            });
+
+            showStatus('Test complete!', true);
+            buttons.forEach(b => b.disabled = false);
+        }
+
+        function displayResults(results) {
+            const resultsDiv = document.getElementById('results-content');
+            resultsDiv.innerHTML = `
+                <div class="metric">
+                    <div class="label">Array Size:</div>
+                    <div class="value">${results.arraySize.toLocaleString()} floats</div>
+                </div>
+                <div class="metric">
+                    <div class="label">GPU Iterations:</div>
+                    <div class="value">${results.iterations.toLocaleString()}</div>
+                </div>
+                <div class="metric">
+                    <div class="label">GPU Total Time:</div>
+                    <div class="value">${results.gpuTotalTime.toFixed(2)} ms</div>
+                </div>
+                <div class="metric">
+                    <div class="label">GPU Time per Iteration:</div>
+                    <div class="value">${results.gpuTimePerIteration.toFixed(4)} ms</div>
+                </div>
+                <div class="metric">
+                    <div class="label">CPU Iterations:</div>
+                    <div class="value">${results.cpuIterations.toLocaleString()}</div>
+                </div>
+                <div class="metric">
+                    <div class="label">CPU Total Time:</div>
+                    <div class="value">${results.cpuTotalTime.toFixed(2)} ms</div>
+                </div>
+                <div class="metric">
+                    <div class="label">CPU Time per Iteration:</div>
+                    <div class="value">${results.cpuTimePerIteration.toFixed(4)} ms</div>
+                </div>
+                <div class="metric">
+                    <div class="label">Speedup:</div>
+                    <div class="value ${results.speedup > 1 ? 'success' : ''}">${results.speedup.toFixed(2)}x ${results.speedup > 1 ? '(GPU faster)' : '(CPU faster)'}</div>
+                </div>
+            `;
+        }
+
+        function showStatus(message, isSuccess = false) {
+            const statusDiv = document.getElementById('status');
+            statusDiv.textContent = message;
+            statusDiv.style.color = isSuccess ? '#22c55e' : '#333';
+        }
+
+        function showError(message) {
+            const statusDiv = document.getElementById('status');
+            statusDiv.innerHTML = `<div class="error">${message}</div>`;
+        }
+    </script>
+</body>
+</html>
