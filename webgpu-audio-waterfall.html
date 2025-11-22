@@ -46,14 +46,28 @@
         button.stop:hover:not(:disabled) {
             background: #dc2626;
         }
-        #canvas {
+        .canvas-container {
+            display: flex;
+            gap: 20px;
+            justify-content: center;
+            margin: 20px 0;
+        }
+        .canvas-wrapper {
+            flex: 1;
+            max-width: 512px;
+        }
+        .canvas-wrapper h3 {
+            text-align: center;
+            margin: 0 0 10px 0;
+            color: #9ca3af;
+            font-size: 14px;
+        }
+        canvas {
             display: block;
             width: 100%;
-            max-width: 1024px;
             height: 512px;
             background: #000;
             border-radius: 8px;
-            margin: 20px auto;
         }
         .status {
             padding: 10px;
@@ -81,20 +95,34 @@
     <h1>WebGPU Audio Spectrum Waterfall</h1>
 
     <div class="info">
-        <strong>Custom FFT Implementation - Speech Focused</strong><br>
-        Captures audio via Web Audio API AnalyserNode, then uses WebGPU compute shaders for custom FFT computation and real-time waterfall visualization.
-        <br><strong>Frequency range: 0 - 8,000 Hz</strong> (optimized for human speech)
-        <br>X-axis: Frequency bins | Y-axis: Time scrolling down
+        <strong>Dual Waterfall - Input/Output Comparison</strong><br>
+        1. Click "Start Recording" to capture audio from your microphone<br>
+        2. Click "Stop" when done recording<br>
+        3. Click "Process Audio" to run your audio processing algorithm (currently just copies input to output)<br>
+        4. Use "Play Input" and "Play Output" to compare the audio before and after processing<br>
+        <strong>Frequency range: 0 - 4,000 Hz</strong> (optimized for human speech) | X-axis: Frequency bins | Y-axis: Time scrolling down
     </div>
 
     <div class="controls">
-        <button id="startBtn" onclick="start()">Start Microphone</button>
+        <button id="startBtn" onclick="start()">Start Recording</button>
         <button id="stopBtn" onclick="stop()" class="stop" disabled>Stop</button>
-        <div id="status" class="status">Click "Start Microphone" to begin</div>
+        <button id="processBtn" onclick="processRecording()" disabled>Process Audio</button>
+        <button id="playInputBtn" onclick="playInput()" disabled>Play Input</button>
+        <button id="playOutputBtn" onclick="playOutput()" disabled>Play Output</button>
+        <div id="status" class="status">Click "Start Recording" to begin</div>
         <div id="debug" style="margin-top: 10px; font-family: monospace; font-size: 12px;"></div>
     </div>
 
-    <canvas id="canvas" width="1024" height="512"></canvas>
+    <div class="canvas-container">
+        <div class="canvas-wrapper">
+            <h3>INPUT</h3>
+            <canvas id="inputCanvas" width="512" height="512"></canvas>
+        </div>
+        <div class="canvas-wrapper">
+            <h3>OUTPUT (Processed)</h3>
+            <canvas id="outputCanvas" width="512" height="512"></canvas>
+        </div>
+    </div>
 
     <script>
         const FFT_SIZE = 1024;
@@ -107,7 +135,8 @@
         const WATERFALL_WIDTH = Math.floor(MAX_DISPLAY_FREQ / FREQ_PER_BIN); // ~186 bins for 0-8kHz
 
         let device = null;
-        let context = null;
+        let inputContext = null;
+        let outputContext = null;
         let renderPipeline = null;
         let fftPipeline = null;
         let scrollPipeline = null;
@@ -117,14 +146,24 @@
         let micStream = null;
         let audioDataArray = null;
 
-        let waterfallTexture = null;
+        let inputWaterfallTexture = null;
+        let outputWaterfallTexture = null;
         let audioBuffer = null;
         let fftBuffer = null;
-        let paramsBuffer = null;
+        let inputParamsBuffer = null;
+        let outputParamsBuffer = null;
 
         let animationId = null;
         let isRunning = false;
-        let currentRow = 0;
+        let isRecording = false;
+        let inputCurrentRow = 0;
+        let outputCurrentRow = 0;
+
+        // Recording storage
+        let recordedInputChunks = [];
+        let recordedOutputChunks = [];
+        let inputAudioBuffer = null;
+        let outputAudioBuffer = null;
 
         async function initWebGPU() {
             if (device) return true;
@@ -143,11 +182,17 @@
 
                 device = await adapter.requestDevice();
 
-                const canvas = document.getElementById('canvas');
-                context = canvas.getContext('webgpu');
+                const inputCanvas = document.getElementById('inputCanvas');
+                const outputCanvas = document.getElementById('outputCanvas');
+                inputContext = inputCanvas.getContext('webgpu');
+                outputContext = outputCanvas.getContext('webgpu');
 
                 const presentationFormat = navigator.gpu.getPreferredCanvasFormat();
-                context.configure({
+                inputContext.configure({
+                    device,
+                    format: presentationFormat,
+                });
+                outputContext.configure({
                     device,
                     format: presentationFormat,
                 });
@@ -166,9 +211,17 @@
         }
 
         async function setupWebGPUResources() {
-            // Create waterfall texture (width = freq bins, height = time)
+            // Create waterfall textures for input and output (width = freq bins, height = time)
             // Use rgba8unorm instead of r8unorm because it supports storage writes
-            waterfallTexture = device.createTexture({
+            inputWaterfallTexture = device.createTexture({
+                size: [WATERFALL_WIDTH, WATERFALL_HEIGHT],
+                format: 'rgba8unorm',
+                usage: GPUTextureUsage.TEXTURE_BINDING |
+                       GPUTextureUsage.STORAGE_BINDING |
+                       GPUTextureUsage.COPY_DST
+            });
+
+            outputWaterfallTexture = device.createTexture({
                 size: [WATERFALL_WIDTH, WATERFALL_HEIGHT],
                 format: 'rgba8unorm',
                 usage: GPUTextureUsage.TEXTURE_BINDING |
@@ -187,30 +240,34 @@
                 usage: GPUBufferUsage.STORAGE
             });
 
-            paramsBuffer = device.createBuffer({
+            inputParamsBuffer = device.createBuffer({
                 size: 4, // u32 for current row
                 usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST
             });
 
-            // Initialize texture with test pattern to verify rendering
-            const testData = new Uint8Array(WATERFALL_WIDTH * WATERFALL_HEIGHT * 4); // RGBA
-            for (let y = 0; y < WATERFALL_HEIGHT; y++) {
-                for (let x = 0; x < WATERFALL_WIDTH; x++) {
-                    const idx = (y * WATERFALL_WIDTH + x) * 4;
-                    const gradient = Math.floor((x / WATERFALL_WIDTH) * 255);
-                    testData[idx + 0] = gradient; // R
-                    testData[idx + 1] = gradient; // G
-                    testData[idx + 2] = gradient; // B
-                    testData[idx + 3] = 255;      // A
-                }
+            outputParamsBuffer = device.createBuffer({
+                size: 4, // u32 for current row
+                usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST
+            });
+
+            // Initialize textures with black
+            const blackData = new Uint8Array(WATERFALL_WIDTH * WATERFALL_HEIGHT * 4); // RGBA
+            for (let i = 0; i < blackData.length; i += 4) {
+                blackData[i + 3] = 255; // Alpha = 1
             }
             device.queue.writeTexture(
-                { texture: waterfallTexture },
-                testData,
+                { texture: inputWaterfallTexture },
+                blackData,
                 { bytesPerRow: WATERFALL_WIDTH * 4 },
                 { width: WATERFALL_WIDTH, height: WATERFALL_HEIGHT }
             );
-            console.log('Test pattern written to texture');
+            device.queue.writeTexture(
+                { texture: outputWaterfallTexture },
+                blackData,
+                { bytesPerRow: WATERFALL_WIDTH * 4 },
+                { width: WATERFALL_WIDTH, height: WATERFALL_HEIGHT }
+            );
+            console.log('Textures initialized');
 
             // Create pipelines
             await createFFTPipeline();
@@ -460,18 +517,23 @@
             // Get time-domain data from analyser
             analyserNode.getFloatTimeDomainData(audioDataArray);
 
+            // Store input data if recording
+            if (isRecording) {
+                recordedInputChunks.push(new Float32Array(audioDataArray));
+            }
+
             // Debug: Check if we're getting audio data
             const audioLevel = Math.max(...audioDataArray.map(Math.abs));
-            if (currentRow % 60 === 0) { // Log every 60 frames (~1 second)
-                console.log('Audio level:', audioLevel.toFixed(4), 'Current row:', currentRow);
-                console.log('Sample data (first 10):', Array.from(audioDataArray.slice(0, 10)).map(v => v.toFixed(3)));
+            if (inputCurrentRow % 60 === 0) { // Log every 60 frames (~1 second)
+                console.log('Audio level:', audioLevel.toFixed(4), 'Current row:', inputCurrentRow);
             }
 
             // Update debug display
-            if (currentRow % 10 === 0) {
+            if (inputCurrentRow % 10 === 0) {
                 const debugDiv = document.getElementById('debug');
                 if (debugDiv) {
-                    debugDiv.textContent = `Audio Level: ${audioLevel.toFixed(4)} | Row: ${currentRow} | Frames: ${renderCount}`;
+                    const status = isRecording ? 'RECORDING' : 'STOPPED';
+                    debugDiv.textContent = `${status} | Audio Level: ${audioLevel.toFixed(4)} | Row: ${inputCurrentRow} | Chunks: ${recordedInputChunks.length}`;
                 }
             }
 
@@ -479,9 +541,9 @@
             device.queue.writeBuffer(audioBuffer, 0, audioDataArray);
 
             // Update current row parameter
-            device.queue.writeBuffer(paramsBuffer, 0, new Uint32Array([currentRow]));
+            device.queue.writeBuffer(inputParamsBuffer, 0, new Uint32Array([inputCurrentRow]));
 
-            // Compute FFT and update waterfall
+            // Compute FFT and update input waterfall
             const commandEncoder = device.createCommandEncoder();
 
             // Run FFT
@@ -498,15 +560,15 @@
             fftPass.dispatchWorkgroups(Math.ceil(FFT_SIZE / 64));
             fftPass.end();
 
-            // Update waterfall texture
+            // Update input waterfall texture
             const scrollPass = commandEncoder.beginComputePass();
             scrollPass.setPipeline(scrollPipeline);
             const scrollBindGroup = device.createBindGroup({
                 layout: scrollPipeline.getBindGroupLayout(0),
                 entries: [
-                    { binding: 0, resource: waterfallTexture.createView() },
+                    { binding: 0, resource: inputWaterfallTexture.createView() },
                     { binding: 1, resource: { buffer: fftBuffer } },
-                    { binding: 2, resource: { buffer: paramsBuffer } }
+                    { binding: 2, resource: { buffer: inputParamsBuffer } }
                 ]
             });
             scrollPass.setBindGroup(0, scrollBindGroup);
@@ -516,65 +578,85 @@
             device.queue.submit([commandEncoder.finish()]);
 
             // Increment row for next frame
-            currentRow = (currentRow + 1) % WATERFALL_HEIGHT;
+            inputCurrentRow = (inputCurrentRow + 1) % WATERFALL_HEIGHT;
         }
 
         let renderCount = 0;
 
         function render() {
-            if (!device || !context) {
-                console.error('Render called but device or context is null:', { device, context });
+            if (!device || !inputContext || !outputContext) {
+                console.error('Render called but device or contexts are null');
                 return;
             }
 
             renderCount++;
-            if (renderCount % 60 === 0) { // Log every 60 frames
-                console.log('Render frame:', renderCount, 'Canvas size:', context.canvas.width, 'x', context.canvas.height);
-            }
-
-            if (renderCount === 1) {
-                console.log('First render - context config:', {
-                    canvas: context.canvas,
-                    format: navigator.gpu.getPreferredCanvasFormat()
-                });
-            }
 
             // Process audio data each frame
             processAudioData();
 
             try {
-                const commandEncoder = device.createCommandEncoder();
-                const textureView = context.getCurrentTexture().createView();
+                const sampler = device.createSampler({
+                    magFilter: 'linear',
+                    minFilter: 'linear',
+                });
 
-                const renderPass = commandEncoder.beginRenderPass({
+                // Render input canvas
+                const inputEncoder = device.createCommandEncoder();
+                const inputTextureView = inputContext.getCurrentTexture().createView();
+
+                const inputRenderPass = inputEncoder.beginRenderPass({
                     colorAttachments: [{
-                        view: textureView,
+                        view: inputTextureView,
                         loadOp: 'clear',
                         clearValue: { r: 0, g: 0, b: 0, a: 1 },
                         storeOp: 'store',
                     }],
                 });
 
-                const sampler = device.createSampler({
-                    magFilter: 'linear',
-                    minFilter: 'linear',
-                });
-
-                const renderBindGroup = device.createBindGroup({
+                const inputBindGroup = device.createBindGroup({
                     layout: renderPipeline.getBindGroupLayout(0),
                     entries: [
-                        { binding: 0, resource: waterfallTexture.createView() },
+                        { binding: 0, resource: inputWaterfallTexture.createView() },
                         { binding: 1, resource: sampler },
-                        { binding: 2, resource: { buffer: paramsBuffer } }
+                        { binding: 2, resource: { buffer: inputParamsBuffer } }
                     ]
                 });
 
-                renderPass.setPipeline(renderPipeline);
-                renderPass.setBindGroup(0, renderBindGroup);
-                renderPass.draw(6);
-                renderPass.end();
+                inputRenderPass.setPipeline(renderPipeline);
+                inputRenderPass.setBindGroup(0, inputBindGroup);
+                inputRenderPass.draw(6);
+                inputRenderPass.end();
 
-                device.queue.submit([commandEncoder.finish()]);
+                device.queue.submit([inputEncoder.finish()]);
+
+                // Render output canvas
+                const outputEncoder = device.createCommandEncoder();
+                const outputTextureView = outputContext.getCurrentTexture().createView();
+
+                const outputRenderPass = outputEncoder.beginRenderPass({
+                    colorAttachments: [{
+                        view: outputTextureView,
+                        loadOp: 'clear',
+                        clearValue: { r: 0, g: 0, b: 0, a: 1 },
+                        storeOp: 'store',
+                    }],
+                });
+
+                const outputBindGroup = device.createBindGroup({
+                    layout: renderPipeline.getBindGroupLayout(0),
+                    entries: [
+                        { binding: 0, resource: outputWaterfallTexture.createView() },
+                        { binding: 1, resource: sampler },
+                        { binding: 2, resource: { buffer: outputParamsBuffer } }
+                    ]
+                });
+
+                outputRenderPass.setPipeline(renderPipeline);
+                outputRenderPass.setBindGroup(0, outputBindGroup);
+                outputRenderPass.draw(6);
+                outputRenderPass.end();
+
+                device.queue.submit([outputEncoder.finish()]);
             } catch (error) {
                 console.error('Render error:', error);
                 isRunning = false;
@@ -600,15 +682,28 @@
                 return;
             }
 
+            // Clear previous recordings
+            recordedInputChunks = [];
+            recordedOutputChunks = [];
+            inputAudioBuffer = null;
+            outputAudioBuffer = null;
+            inputCurrentRow = 0;
+            outputCurrentRow = 0;
+
             isRunning = true;
+            isRecording = true;
             document.getElementById('stopBtn').disabled = false;
-            showStatus('Running - microphone active', true);
+            document.getElementById('processBtn').disabled = true;
+            document.getElementById('playInputBtn').disabled = true;
+            document.getElementById('playOutputBtn').disabled = true;
+            showStatus('Recording - microphone active', true);
 
             render();
         }
 
         function stop() {
             isRunning = false;
+            isRecording = false;
 
             if (animationId) {
                 cancelAnimationFrame(animationId);
@@ -631,7 +726,195 @@
 
             document.getElementById('startBtn').disabled = false;
             document.getElementById('stopBtn').disabled = true;
-            showStatus('Stopped');
+
+            // Enable process button if we have recorded data
+            if (recordedInputChunks.length > 0) {
+                document.getElementById('processBtn').disabled = false;
+                showStatus(`Recording stopped. Captured ${recordedInputChunks.length} chunks. Click "Process Audio" to continue.`);
+            } else {
+                showStatus('Stopped - no data recorded');
+            }
+        }
+
+        // PLACEHOLDER AUDIO PROCESSING FUNCTION
+        // Replace this with your own audio processing algorithm
+        function processAudioBuffer(inputData) {
+            // For now, just copy the input to output
+            // You can replace this with any processing you want:
+            // - Noise reduction
+            // - Equalization
+            // - Compression
+            // - etc.
+            console.log('Processing audio... (currently just copying input to output)');
+            return new Float32Array(inputData);
+        }
+
+        async function processRecording() {
+            if (recordedInputChunks.length === 0) {
+                showError('No recorded data to process');
+                return;
+            }
+
+            showStatus('Processing audio...');
+            document.getElementById('processBtn').disabled = true;
+
+            // Concatenate all input chunks into a single buffer
+            const totalSamples = recordedInputChunks.reduce((sum, chunk) => sum + chunk.length, 0);
+            const inputData = new Float32Array(totalSamples);
+            let offset = 0;
+            for (const chunk of recordedInputChunks) {
+                inputData.set(chunk, offset);
+                offset += chunk.length;
+            }
+
+            console.log(`Processing ${totalSamples} samples (${(totalSamples / SAMPLE_RATE).toFixed(2)} seconds)`);
+
+            // Process the audio (placeholder - just copies for now)
+            const outputData = processAudioBuffer(inputData);
+
+            // Split output back into chunks for visualization
+            recordedOutputChunks = [];
+            for (let i = 0; i < outputData.length; i += FFT_SIZE) {
+                const chunk = outputData.slice(i, i + FFT_SIZE);
+                if (chunk.length === FFT_SIZE) {
+                    recordedOutputChunks.push(chunk);
+                }
+            }
+
+            // Visualize the output
+            await visualizeOutput();
+
+            // Enable playback buttons
+            document.getElementById('playInputBtn').disabled = false;
+            document.getElementById('playOutputBtn').disabled = false;
+            showStatus('Processing complete. You can now play input/output.', true);
+        }
+
+        async function visualizeOutput() {
+            if (!device || recordedOutputChunks.length === 0) return;
+
+            showStatus('Generating output waterfall...');
+            outputCurrentRow = 0;
+
+            for (const chunk of recordedOutputChunks) {
+                // Copy audio data to GPU buffer
+                device.queue.writeBuffer(audioBuffer, 0, chunk);
+                device.queue.writeBuffer(outputParamsBuffer, 0, new Uint32Array([outputCurrentRow]));
+
+                // Compute FFT and update output waterfall
+                const commandEncoder = device.createCommandEncoder();
+
+                // Run FFT
+                const fftPass = commandEncoder.beginComputePass();
+                fftPass.setPipeline(fftPipeline);
+                const fftBindGroup = device.createBindGroup({
+                    layout: fftPipeline.getBindGroupLayout(0),
+                    entries: [
+                        { binding: 0, resource: { buffer: audioBuffer } },
+                        { binding: 1, resource: { buffer: fftBuffer } }
+                    ]
+                });
+                fftPass.setBindGroup(0, fftBindGroup);
+                fftPass.dispatchWorkgroups(Math.ceil(FFT_SIZE / 64));
+                fftPass.end();
+
+                // Update output waterfall texture
+                const scrollPass = commandEncoder.beginComputePass();
+                scrollPass.setPipeline(scrollPipeline);
+                const scrollBindGroup = device.createBindGroup({
+                    layout: scrollPipeline.getBindGroupLayout(0),
+                    entries: [
+                        { binding: 0, resource: outputWaterfallTexture.createView() },
+                        { binding: 1, resource: { buffer: fftBuffer } },
+                        { binding: 2, resource: { buffer: outputParamsBuffer } }
+                    ]
+                });
+                scrollPass.setBindGroup(0, scrollBindGroup);
+                scrollPass.dispatchWorkgroups(Math.ceil(WATERFALL_WIDTH / 64));
+                scrollPass.end();
+
+                device.queue.submit([commandEncoder.finish()]);
+
+                outputCurrentRow = (outputCurrentRow + 1) % WATERFALL_HEIGHT;
+            }
+
+            // Render both canvases one final time
+            const sampler = device.createSampler({
+                magFilter: 'linear',
+                minFilter: 'linear',
+            });
+
+            // Render output canvas
+            const outputEncoder = device.createCommandEncoder();
+            const outputTextureView = outputContext.getCurrentTexture().createView();
+
+            const outputRenderPass = outputEncoder.beginRenderPass({
+                colorAttachments: [{
+                    view: outputTextureView,
+                    loadOp: 'clear',
+                    clearValue: { r: 0, g: 0, b: 0, a: 1 },
+                    storeOp: 'store',
+                }],
+            });
+
+            const outputBindGroup = device.createBindGroup({
+                layout: renderPipeline.getBindGroupLayout(0),
+                entries: [
+                    { binding: 0, resource: outputWaterfallTexture.createView() },
+                    { binding: 1, resource: sampler },
+                    { binding: 2, resource: { buffer: outputParamsBuffer } }
+                ]
+            });
+
+            outputRenderPass.setPipeline(renderPipeline);
+            outputRenderPass.setBindGroup(0, outputBindGroup);
+            outputRenderPass.draw(6);
+            outputRenderPass.end();
+
+            device.queue.submit([outputEncoder.finish()]);
+        }
+
+        function playInput() {
+            playAudioBuffer(recordedInputChunks, 'input');
+        }
+
+        function playOutput() {
+            playAudioBuffer(recordedOutputChunks, 'output');
+        }
+
+        function playAudioBuffer(chunks, label) {
+            if (chunks.length === 0) {
+                showError(`No ${label} data to play`);
+                return;
+            }
+
+            // Concatenate chunks
+            const totalSamples = chunks.reduce((sum, chunk) => sum + chunk.length, 0);
+            const audioData = new Float32Array(totalSamples);
+            let offset = 0;
+            for (const chunk of chunks) {
+                audioData.set(chunk, offset);
+                offset += chunk.length;
+            }
+
+            // Create audio context and buffer
+            const playbackContext = new AudioContext({ sampleRate: SAMPLE_RATE });
+            const buffer = playbackContext.createBuffer(1, audioData.length, SAMPLE_RATE);
+            buffer.copyToChannel(audioData, 0);
+
+            // Play
+            const source = playbackContext.createBufferSource();
+            source.buffer = buffer;
+            source.connect(playbackContext.destination);
+            source.start();
+
+            const duration = audioData.length / SAMPLE_RATE;
+            showStatus(`Playing ${label} (${duration.toFixed(2)}s)...`, true);
+
+            source.onended = () => {
+                playbackContext.close();
+                showStatus(`${label} playback finished`);
+            };
         }
 
         function showStatus(message, isSuccess = false) {
