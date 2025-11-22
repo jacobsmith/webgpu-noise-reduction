@@ -82,8 +82,10 @@ function processAudioBuffer(inputData) {
 
 - `webgpu-audio-waterfall.html` - Main application
 - `dev-server.py` - Development HTTP server with CORS support (required for "Load Test File")
-- `generate-test-audio.py` - Script to generate test audio (3s chirp from 200-2000 Hz)
+- `generate-test-audio.py` - Script to generate simple test audio (3s chirp from 200-2000 Hz)
+- `create-test-audio-dataset.py` - Advanced: Generate speech + noise datasets for noise reduction testing
 - `test-audio.wav` - Generated test audio file (created by running the Python script)
+- `DATASET_GUIDE.md` - Complete guide for creating noise reduction test datasets
 
 ## Requirements
 
@@ -92,6 +94,35 @@ function processAudioBuffer(inputData) {
 - For microphone recording: HTTPS or localhost
 - For "Load Test File" button: Dev server must be running (`python3 dev-server.py`)
 - For file upload: No special requirements (works without dev server)
+
+## Noise Reduction Testing
+
+For developing speech noise reduction algorithms:
+
+### Generate Test Dataset
+
+```bash
+# Without Freesound API key (uses synthetic noise)
+python3 create-test-audio-dataset.py
+
+# With Freesound API key (includes real background noise)
+python3 create-test-audio-dataset.py YOUR_API_KEY
+```
+
+This creates:
+- Clean speech sample (from LibriVox)
+- Noise sources (white, pink, brown, cafe ambience)
+- Mixed samples at SNR levels: 0dB, 5dB, 10dB, 15dB, 20dB
+
+See [DATASET_GUIDE.md](DATASET_GUIDE.md) for complete documentation.
+
+### Recommended Workflow
+
+1. Generate dataset: `python3 create-test-audio-dataset.py`
+2. Copy test file: `cp test-audio-dataset/mixed_noise_pink_snr10db.wav ./test-audio.wav`
+3. Update `processAudioBuffer()` with your noise reduction algorithm
+4. Test visually with waterfalls and aurally with playback buttons
+5. Try different SNR levels and noise types
 
 ## Technical Details
 
