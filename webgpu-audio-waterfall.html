@@ -181,17 +181,17 @@
         <div class="button-group">
             <label>Noise Reduction Parameters</label>
             <div style="display: grid; grid-template-columns: 150px 1fr 80px; gap: 10px; margin-bottom: 10px; align-items: center; font-size: 14px;">
-                <label for="noiseGain" style="margin: 0;" title="Gain applied when signal ≤ noise (0 = full cut, 1 = no reduction)">Noise Gain:</label>
-                <input type="range" id="noiseGain" min="0" max="1" step="0.05" value="0.2" style="width: 100%;" oninput="updateParamDisplay()" title="Lower = more aggressive noise removal">
-                <span id="noiseGainValue" style="color: #9ca3af;">0.20</span>
-
-                <label for="signalGain" style="margin: 0;" title="Gain applied when signal > noise (typically 1.0)">Signal Gain:</label>
-                <input type="range" id="signalGain" min="0" max="2" step="0.1" value="1.0" style="width: 100%;" oninput="updateParamDisplay()" title="Gain for speech (1.0 = unchanged)">
-                <span id="signalGainValue" style="color: #9ca3af;">1.00</span>
-
                 <label for="alphaDecay" style="margin: 0;" title="Learning rate for noise profile adaptation (lower = slower adaptation)">Alpha Decay:</label>
                 <input type="range" id="alphaDecay" min="0.001" max="0.1" step="0.001" value="0.01" style="width: 100%;" oninput="updateParamDisplay()" title="How fast noise estimate adapts">
                 <span id="alphaDecayValue" style="color: #9ca3af;">0.010</span>
+
+                <label for="noiseSuppressionFactor" style="margin: 0;" title="How aggressively to subtract noise (higher = more removal, more artifacts)">Noise Suppression:</label>
+                <input type="range" id="noiseSuppressionFactor" min="0" max="5" step="0.1" value="3" style="width: 100%;" oninput="updateParamDisplay()" title="Oversubtraction factor for spectral subtraction">
+                <span id="noiseSuppressionFactorValue" style="color: #9ca3af;">3.0</span>
+
+                <label for="noiseFloor" style="margin: 0;" title="Minimum gain - reduces warbling at cost of more residual noise">Noise Floor:</label>
+                <input type="range" id="noiseFloor" min="0" max="0.5" step="0.05" value="0.1" style="width: 100%;" oninput="updateParamDisplay()" title="Lower = less warble but more residual noise; Higher = smoother but keeps more noise">
+                <span id="noiseFloorValue" style="color: #9ca3af;">0.10</span>
             </div>
             <button onclick="applyParameters()" style="background: #059669; margin-bottom: 10px;" title="Recreate GPU pipelines with new parameter values">Apply Parameters</button>
             <button onclick="resetParameters()" style="background: #6b7280;" title="Reset all parameters to default values">Reset to Defaults</button>
@@ -229,10 +229,9 @@
         const FREQ_PER_BIN = SAMPLE_RATE / FFT_SIZE; // ~86 Hz per bin
         const WATERFALL_WIDTH = Math.floor(MAX_DISPLAY_FREQ / FREQ_PER_BIN); // ~186 bins for 0-8kHz
 
-        let NOISE_GAIN = 0.2;
-        let SIGNAL_GAIN = 1.0;
         let ALPHA_DECAY = 0.01;
         let NOISE_SUPRESSION_FACTOR = 3;
+        let NOISE_FLOOR = 0.1;
 
         let device = null;
         let inputContext = null;
@@ -466,9 +465,8 @@
 
             const FFT_SIZE: u32 = ${FFT_SIZE};
             const WATERFALL_WIDTH: u32 = ${WATERFALL_WIDTH};
-            const NOISE_GAIN: f32 = ${NOISE_GAIN};
-            const SIGNAL_GAIN: f32 = ${SIGNAL_GAIN};
             const NOISE_SUPRESSION_FACTOR: f32 = ${NOISE_SUPRESSION_FACTOR};
+            const NOISE_FLOOR: f32 = ${NOISE_FLOOR};
 
             @compute @workgroup_size(64)
             fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
@@ -484,7 +482,8 @@
 
                     let cleanMagnitude = max(0.0, signalMagnitude - NOISE_SUPRESSION_FACTOR * noiseMagnitude);
                     let gain = cleanMagnitude / max(signalMagnitude, 0.001);
-                    processedFFTBuffer[k] = fftBuffer[k] * gain;
+                    let finalGain = max(NOISE_FLOOR, gain);
+                    processedFFTBuffer[k] = fftBuffer[k] * finalGain;
                 }
             }
             `;
@@ -1236,7 +1235,7 @@
         // GPU-BASED AUDIO PROCESSING
         async function processAudioBuffer(inputData) {
             console.log('=== GPU NOISE REDUCTION START ===');
-            console.log(`Parameters: Noise Gain=${NOISE_GAIN}, Signal Gain=${SIGNAL_GAIN}, Alpha=${ALPHA_DECAY}`);
+            console.log(`Parameters: Suppression=${NOISE_SUPRESSION_FACTOR}, Floor=${NOISE_FLOOR}, Alpha=${ALPHA_DECAY}`);
 
             // Split input into chunks
             const chunks = [];
@@ -1586,13 +1585,13 @@
         }
 
         function updateParamDisplay() {
-            const noiseGain = parseFloat(document.getElementById('noiseGain').value);
-            const signalGain = parseFloat(document.getElementById('signalGain').value);
             const alphaDecay = parseFloat(document.getElementById('alphaDecay').value);
+            const noiseSuppression = parseFloat(document.getElementById('noiseSuppressionFactor').value);
+            const noiseFloor = parseFloat(document.getElementById('noiseFloor').value);
 
-            document.getElementById('noiseGainValue').textContent = noiseGain.toFixed(2);
-            document.getElementById('signalGainValue').textContent = signalGain.toFixed(2);
             document.getElementById('alphaDecayValue').textContent = alphaDecay.toFixed(3);
+            document.getElementById('noiseSuppressionFactorValue').textContent = noiseSuppression.toFixed(1);
+            document.getElementById('noiseFloorValue').textContent = noiseFloor.toFixed(2);
         }
 
         async function applyParameters() {
@@ -1602,18 +1601,24 @@
             }
 
             // Read values from UI
-            NOISE_GAIN = parseFloat(document.getElementById('noiseGain').value);
-            SIGNAL_GAIN = parseFloat(document.getElementById('signalGain').value);
             ALPHA_DECAY = parseFloat(document.getElementById('alphaDecay').value);
+            NOISE_SUPRESSION_FACTOR = parseFloat(document.getElementById('noiseSuppressionFactor').value);
+            NOISE_FLOOR = parseFloat(document.getElementById('noiseFloor').value);
 
             showStatus('Applying parameters and recreating pipelines...');
 
             try {
+                // Reset noise profile to high values for fresh learning
+                const initNoiseProfile = new Float32Array(WATERFALL_WIDTH);
+                initNoiseProfile.fill(1000.0);
+                device.queue.writeBuffer(noiseProfile, 0, initNoiseProfile);
+                console.log('Noise profile reset for new parameters');
+
                 // Recreate pipelines with new parameter values
                 await createNoiseReductionPipeline();
                 await createUpdateNoisePipeline();
 
-                showStatus(`Parameters applied! Noise Gain: ${NOISE_GAIN.toFixed(2)}, Signal Gain: ${SIGNAL_GAIN.toFixed(2)}, Alpha: ${ALPHA_DECAY.toFixed(3)}`, true);
+                showStatus(`Parameters applied! Suppression: ${NOISE_SUPRESSION_FACTOR.toFixed(1)}, Floor: ${NOISE_FLOOR.toFixed(2)}. Noise profile reset.`, true);
             } catch (error) {
                 showError('Error applying parameters: ' + error.message);
                 console.error('Parameter application error:', error);
@@ -1622,9 +1627,9 @@
 
         function resetParameters() {
             // Reset to defaults
-            document.getElementById('noiseGain').value = 0.2;
-            document.getElementById('signalGain').value = 1.0;
             document.getElementById('alphaDecay').value = 0.01;
+            document.getElementById('noiseSuppressionFactor').value = 3.0;
+            document.getElementById('noiseFloor').value = 0.1;
 
             updateParamDisplay();
             showStatus('Parameters reset to defaults. Click "Apply Parameters" to use them.');

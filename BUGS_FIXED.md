@@ -244,11 +244,148 @@ Where `elementCount` is the actual number of elements to process, not necessaril
 
 ---
 
+## Bug #4: Missing COPY_SRC Buffer Usage Flags
+
+### Symptom
+Debug functions (`debugNoiseProfile()`, FFT magnitude readback) returned all zeros even though buffers were initialized with non-zero values.
+
+### Root Cause
+GPU buffers were created without `GPUBufferUsage.COPY_SRC` flag, which is required to copy data from GPU back to CPU for debugging:
+
+```javascript
+// WRONG - can't read back from GPU
+noiseProfile = device.createBuffer({
+    size: WATERFALL_WIDTH * 4,
+    usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+});
+
+fftBuffer = device.createBuffer({
+    size: FFT_SIZE * 2 * 4,
+    usage: GPUBufferUsage.STORAGE,
+});
+```
+
+### Why This Broke Debugging
+WebGPU buffer usage flags control what operations are allowed:
+- `STORAGE`: Can be used in compute shaders (read/write)
+- `COPY_DST`: Can be written to from CPU → GPU
+- `COPY_SRC`: Can be read from GPU → CPU ← **MISSING!**
+
+Without `COPY_SRC`, the `copyBufferToBuffer()` command silently failed or returned undefined data.
+
+### Fix
+Add `COPY_SRC` flag to any buffer you need to read back for debugging:
+
+```javascript
+// CORRECT - can read back
+noiseProfile = device.createBuffer({
+    size: WATERFALL_WIDTH * 4,
+    usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC,
+});
+
+fftBuffer = device.createBuffer({
+    size: FFT_SIZE * 2 * 4,
+    usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC,
+});
+```
+
+### Lesson Learned
+**Plan for debugging from the start.** Add `COPY_SRC` to buffers you might need to inspect, even during development. WebGPU's explicit buffer usage flags catch errors but can make debugging harder if you forget them.
+
+---
+
+## Bug #5: Binary Gate Instead of Spectral Subtraction
+
+### Symptom
+Noise reduction had no audible effect. RMS ratio was ~1.0 (meaning output ≈ input) even with extreme settings like `NOISE_GAIN = 0.0`.
+
+### Root Cause
+Implemented a simple binary gate instead of proper spectral subtraction:
+
+```wgsl
+// WRONG - binary gate
+if (signalMagnitude > noiseMagnitude) {
+    gain = SIGNAL_GAIN;  // 1.0 - no reduction!
+} else {
+    gain = NOISE_GAIN;   // 0.2 - reduce by 80%
+}
+processedFFTBuffer[k] = fftBuffer[k] * gain;
+```
+
+### Why This Didn't Work
+**Diagnostic data at 5.0s:**
+- FFT magnitudes (speech range): 0.237 - 1.495
+- Noise profile: 0.038 - 1.134
+
+When speech is present, `signalMagnitude > noiseMagnitude` for most frequency bins, so the shader applied `SIGNAL_GAIN = 1.0` (no change). Only bins where current magnitude ≤ noise profile got reduced, which was rare during speech.
+
+**The algorithm was a noise gate, not noise reduction:**
+- Voice active → most bins get gain 1.0 → no effect
+- Voice silent → some bins get gain 0.2 → only helps in silence
+
+### The Conceptual Mistake
+Noise reduction should **subtract the noise energy** from the signal, not gate it:
+- Speech + Noise has magnitude `S + N`
+- We want to recover `S` by computing `(S + N) - N`
+- Binary gate just checks if `S + N > N` and keeps everything or removes everything
+
+### Fix
+Implement spectral subtraction that removes noise energy:
+
+```wgsl
+let noiseMagnitude = noiseProfile[k];
+let signalMagnitude = length(fftBuffer[k]);
+
+// Subtract noise with oversubtraction factor
+let cleanMagnitude = max(0.0, signalMagnitude - NOISE_SUPPRESSION_FACTOR * noiseMagnitude);
+let gain = cleanMagnitude / max(signalMagnitude, 0.001);  // Avoid div by zero
+
+processedFFTBuffer[k] = fftBuffer[k] * gain;
+```
+
+Where `NOISE_SUPPRESSION_FACTOR` (typically 2.0-3.0) controls aggressiveness. Higher values remove more noise but can introduce artifacts.
+
+### Key Parameters
+After this fix, the system has three independent parameters:
+
+1. **ALPHA_DECAY** (0.001-0.1): How fast noise profile adapts to new minimums
+   - Used in: Noise profile update shader
+   - Smaller = slower, more stable estimate
+
+2. **NOISE_SUPPRESSION_FACTOR** (1.0-5.0): How aggressively to subtract noise
+   - Used in: Spectral subtraction calculation
+   - Larger = more noise removed, more artifacts
+
+3. **NOISE_FLOOR** (optional, 0.1): Minimum gain to prevent musical noise
+   - Prevents gain from going to pure zero
+   - Reduces artifacts at cost of some residual noise
+
+### Lesson Learned
+**Understand the difference between noise gating and noise reduction:**
+- **Noise gate**: If signal < threshold, mute it. Binary on/off. Doesn't work when noise and signal overlap.
+- **Noise reduction/subtraction**: Estimate noise energy and subtract it from the signal. Works even when speech and noise are simultaneous.
+
+For speech in noisy environments, spectral subtraction is essential because speech and noise are always present together in the frequency domain.
+
+---
+
+## Updated Summary Table
+
+| Bug | Impact | Root Cause | Fix |
+|-----|--------|------------|-----|
+| Uninitialized Buffer | No noise reduction | Started at 0 instead of high value | Initialize with 1000.0 |
+| Out-of-Bounds Access | Undefined behavior | Used FFT_SIZE instead of WATERFALL_WIDTH | Check k < WATERFALL_WIDTH |
+| Wrong Dispatch Size | Excessive shader invocations | Copy-paste from different pipeline | Use WATERFALL_WIDTH / 64 |
+| Missing COPY_SRC Flags | Debug functions showed zeros | Forgot buffer usage flag for GPU→CPU | Add COPY_SRC to buffers |
+| Binary Gate Algorithm | No audible effect | Used if/else instead of subtraction | Spectral subtraction formula |
+
+---
+
 ## Date Fixed
 2025-11-23
 
 ## Related Files
-- `webgpu-audio-waterfall.html` (lines 358-366: buffer initialization)
-- `webgpu-audio-waterfall.html` (lines 552-575: noise update shader)
-- `webgpu-audio-waterfall.html` (lines 459-493: noise reduction shader)
-- `webgpu-audio-waterfall.html` (line 1282: dispatch fix)
+- `webgpu-audio-waterfall.html` (lines 343-367: buffer initialization with COPY_SRC)
+- `webgpu-audio-waterfall.html` (lines 462-489: spectral subtraction shader)
+- `webgpu-audio-waterfall.html` (lines 552-598: noise update shader)
+- `webgpu-audio-waterfall.html` (lines 1352-1389: diagnostic logging)
