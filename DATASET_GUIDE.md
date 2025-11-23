@@ -19,8 +19,20 @@ This will:
 ### Option 2: With Freesound (Real background noise)
 
 1. Get a free API key: https://freesound.org/apiv2/apply/
-2. Run with API key:
 
+2. **Recommended:** Add to `.env` file:
+   ```bash
+   cp .env.example .env
+   # Edit .env and add your API key:
+   # FREESOUND_API_KEY=your_actual_api_key_here
+   ```
+
+3. Run the script:
+   ```bash
+   python3 create-test-audio-dataset.py
+   ```
+
+**Alternative:** Pass API key via command line:
 ```bash
 python3 create-test-audio-dataset.py YOUR_API_KEY
 ```

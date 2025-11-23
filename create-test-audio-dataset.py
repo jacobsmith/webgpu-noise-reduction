@@ -17,7 +17,32 @@ import random
 
 # Configuration
 OUTPUT_DIR = "test-audio-dataset"
-FREESOUND_API_KEY = ""  # Add your API key here or pass via command line
+FREESOUND_API_KEY = ""  # Will be loaded from .env file
+
+# Load environment variables from .env file
+def load_env():
+    """Load environment variables from .env file if it exists."""
+    env_path = os.path.join(os.path.dirname(__file__), '.env')
+    if os.path.exists(env_path):
+        with open(env_path, 'r') as f:
+            for line in f:
+                line = line.strip()
+                # Skip empty lines and comments
+                if not line or line.startswith('#'):
+                    continue
+                # Parse KEY=VALUE
+                if '=' in line:
+                    key, value = line.split('=', 1)
+                    key = key.strip()
+                    value = value.strip()
+                    # Set as environment variable
+                    os.environ[key] = value
+
+# Load .env file
+load_env()
+
+# Get API key from environment variable or command line
+FREESOUND_API_KEY = os.environ.get('FREESOUND_API_KEY', '')
 
 # SNR levels to test (in dB)
 SNR_LEVELS = [0, 5, 10, 15, 20]
@@ -451,15 +476,17 @@ def main():
     print("for Speech Noise Reduction Testing")
     print("=" * 60)
 
-    # Check for API key in command line
+    # Check for API key in command line (overrides .env)
     if len(sys.argv) > 1:
         FREESOUND_API_KEY = sys.argv[1]
         print(f"\nUsing Freesound API key from command line")
     elif FREESOUND_API_KEY:
-        print(f"\nUsing Freesound API key from script")
+        print(f"\nUsing Freesound API key from .env file")
     else:
         print(f"\nNo Freesound API key provided (optional)")
-        print("Get one at: https://freesound.org/apiv2/apply/")
+        print("  - Get one at: https://freesound.org/apiv2/apply/")
+        print("  - Add to .env file or pass as command line argument")
+        print("  - Synthetic noise will be generated instead")
 
     # Create output directory
     os.makedirs(OUTPUT_DIR, exist_ok=True)

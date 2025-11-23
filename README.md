@@ -102,10 +102,16 @@ For developing speech noise reduction algorithms:
 ### Generate Test Dataset
 
 ```bash
-# Without Freesound API key (uses synthetic noise)
+# Option 1: Without Freesound API key (uses synthetic noise)
 python3 create-test-audio-dataset.py
 
-# With Freesound API key (includes real background noise)
+# Option 2: With Freesound API key (includes real background noise)
+# First, copy .env.example to .env and add your API key:
+cp .env.example .env
+# Then edit .env and add: FREESOUND_API_KEY=your_key_here
+python3 create-test-audio-dataset.py
+
+# Alternative: Pass API key via command line
 python3 create-test-audio-dataset.py YOUR_API_KEY
 ```
 
