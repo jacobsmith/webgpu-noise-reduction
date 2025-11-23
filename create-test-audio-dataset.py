@@ -35,8 +35,13 @@ def load_env():
                     key, value = line.split('=', 1)
                     key = key.strip()
                     value = value.strip()
-                    # Set as environment variable
-                    os.environ[key] = value
+                    # Remove quotes if present
+                    if value.startswith('"') and value.endswith('"'):
+                        value = value[1:-1]
+                    if value.startswith("'") and value.endswith("'"):
+                        value = value[1:-1]
+                    # Set as environment variable (strip any remaining whitespace)
+                    os.environ[key] = value.strip()
 
 # Load .env file
 load_env()
@@ -252,48 +257,110 @@ def download_file(url, output_path, description="file"):
         return False
 
 
-def download_librivox_sample(output_dir):
-    """
-    Download a speech sample from LibriVox.
-    Uses a known public domain audiobook URL.
-    """
-    print("\n[1/3] Downloading speech sample from LibriVox...")
+def generate_synthetic_speech(output_dir):
+    """Generate synthetic speech-like signal for testing."""
+    print("\n[1/3] Generating synthetic speech sample...")
 
-    # Using a short sample from LibriVox's archive
-    # This is a public domain recording
-    url = "https://ia600300.us.archive.org/11/items/rumpelstiltskin_1711_librivox/rumpelstiltskin_01_grimm_64kb.mp3"
-
-    mp3_path = os.path.join(output_dir, "speech_sample.mp3")
     wav_path = os.path.join(output_dir, "speech_clean.wav")
 
     if os.path.exists(wav_path):
         print(f"  Speech sample already exists: {wav_path}")
         return wav_path
 
-    # Download MP3
-    if not download_file(url, mp3_path, "LibriVox speech sample (MP3)"):
-        return None
+    # Generate a speech-like signal using multiple frequency modulated tones
+    # This simulates the formant structure of human speech
+    duration = 10.0  # seconds
+    num_samples = int(SAMPLE_RATE * duration)
+    audio_data = []
 
-    # Convert MP3 to WAV using ffmpeg (if available)
-    print("  Converting MP3 to WAV...")
-    print("  NOTE: This requires ffmpeg. If you don't have it:")
-    print("        - macOS: brew install ffmpeg")
-    print("        - Linux: sudo apt-get install ffmpeg")
-    print("        - Or manually convert the MP3 to WAV and place at:", wav_path)
+    print("  Generating speech-like signal (formant synthesis)...")
 
-    import subprocess
-    try:
-        subprocess.run([
-            'ffmpeg', '-i', mp3_path, '-ar', str(SAMPLE_RATE),
-            '-ac', '1', '-t', '10', wav_path, '-y'
-        ], check=True, capture_output=True)
-        print(f"  ✓ Converted to {wav_path}")
-        os.remove(mp3_path)
+    for i in range(num_samples):
+        t = i / SAMPLE_RATE
+
+        # Simulate speech with 3 formants (typical for vowels)
+        # F1: 500-700 Hz, F2: 1200-2400 Hz, F3: 2500-3500 Hz
+        f1 = 600 + 100 * math.sin(2 * math.pi * 2 * t)  # Varying formant 1
+        f2 = 1800 + 300 * math.sin(2 * math.pi * 3 * t)  # Varying formant 2
+        f3 = 3000 + 200 * math.sin(2 * math.pi * 5 * t)  # Varying formant 3
+
+        # Fundamental frequency (pitch) varying like natural speech
+        f0 = 120 + 20 * math.sin(2 * math.pi * 4 * t)  # ~120 Hz (male voice)
+
+        # Generate signal with formants
+        formant1 = 0.5 * math.sin(2 * math.pi * f1 * t)
+        formant2 = 0.3 * math.sin(2 * math.pi * f2 * t)
+        formant3 = 0.2 * math.sin(2 * math.pi * f3 * t)
+        fundamental = 0.4 * math.sin(2 * math.pi * f0 * t)
+
+        # Add slight "plosive" bursts to simulate consonants
+        if i % (SAMPLE_RATE // 3) < (SAMPLE_RATE // 30):  # Every ~0.33s, brief burst
+            burst = random.uniform(-0.3, 0.3)
+        else:
+            burst = 0
+
+        # Combine all components
+        sample = (fundamental + formant1 + formant2 + formant3 + burst) / 3.0
+
+        # Apply envelope (amplitude modulation to simulate syllables)
+        envelope = 0.3 + 0.7 * (0.5 + 0.5 * math.sin(2 * math.pi * 3 * t))
+        sample *= envelope
+
+        # Clip
+        sample = max(-1.0, min(1.0, sample))
+        audio_data.append(sample)
+
+    # Save as WAV
+    speech = AudioFile(SAMPLE_RATE, audio_data)
+    speech.write_wav(wav_path)
+    print(f"  ✓ Generated synthetic speech: {wav_path}")
+    print(f"  Duration: {duration}s")
+
+    return wav_path
+
+
+def download_librivox_sample(output_dir):
+    """
+    Download a speech sample from LibriVox.
+    Falls back to synthetic speech if download fails.
+    """
+    print("\n[1/3] Downloading speech sample from LibriVox...")
+
+    wav_path = os.path.join(output_dir, "speech_clean.wav")
+
+    if os.path.exists(wav_path):
+        print(f"  Speech sample already exists: {wav_path}")
         return wav_path
-    except (subprocess.CalledProcessError, FileNotFoundError) as e:
-        print(f"  ✗ ffmpeg not available or conversion failed")
-        print(f"    Please manually convert {mp3_path} to WAV format")
-        return None
+
+    # Try several LibriVox sources
+    urls_to_try = [
+        "https://www.archive.org/download/short_nonfiction_collection_vol004_1002_librivox/snc004_05_jefferson_128kb.mp3",
+        "https://archive.org/download/lifeofbenjaminfranklin_0911_librivox/franklin_02_franklin_128kb.mp3",
+    ]
+
+    mp3_path = os.path.join(output_dir, "speech_sample.mp3")
+
+    for url in urls_to_try:
+        print(f"  Trying: {url}")
+        if download_file(url, mp3_path, "LibriVox speech (MP3)"):
+            # Try to convert
+            print("  Converting MP3 to WAV...")
+            import subprocess
+            try:
+                subprocess.run([
+                    'ffmpeg', '-i', mp3_path, '-ar', str(SAMPLE_RATE),
+                    '-ac', '1', '-t', '10', wav_path, '-y'
+                ], check=True, capture_output=True)
+                print(f"  ✓ Converted to {wav_path}")
+                os.remove(mp3_path)
+                return wav_path
+            except (subprocess.CalledProcessError, FileNotFoundError):
+                print(f"  ✗ ffmpeg conversion failed")
+                continue
+
+    # If all downloads failed, generate synthetic speech
+    print("  ⚠ Download failed, generating synthetic speech instead...")
+    return generate_synthetic_speech(output_dir)
 
 
 def download_freesound_noise(api_key, output_dir):
@@ -307,7 +374,8 @@ def download_freesound_noise(api_key, output_dir):
 
     # Search for cafe/restaurant ambience
     search_query = "cafe ambience"
-    url = f"https://freesound.org/apiv2/search/text/?query={urllib.parse.quote(search_query)}&filter=duration:[5.0 TO 30.0]&fields=id,name,previews&token={api_key}"
+    filter_param = "duration:[5.0 TO 30.0]"
+    url = f"https://freesound.org/apiv2/search/text/?query={urllib.parse.quote(search_query)}&filter={urllib.parse.quote(filter_param)}&fields=id,name,previews&token={urllib.parse.quote(api_key)}"
 
     try:
         print(f"  Searching Freesound for: {search_query}")
