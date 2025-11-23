@@ -334,6 +334,7 @@ def download_librivox_sample(output_dir):
 
     # Try several LibriVox sources
     urls_to_try = [
+        "https://archive.org/download/art_war_ps_librivox/artofwar_01_sun.mp3",
         "https://www.archive.org/download/short_nonfiction_collection_vol004_1002_librivox/snc004_05_jefferson_128kb.mp3",
         "https://archive.org/download/lifeofbenjaminfranklin_0911_librivox/franklin_02_franklin_128kb.mp3",
     ]
