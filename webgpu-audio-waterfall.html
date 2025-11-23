@@ -393,32 +393,36 @@
             }
         }
 
+
+
+        // { binding: 0, resource: { buffer: noiseProfile }},
+        // { binding: 1, resource: { buffer: fftBuffer }},
+        // { binding: 2, resource: { buffer: processedFFTBuffer }}
         async function createNoiseReductionPipeline() {
             const noiseReductionShader = `
-                @group(0) @binding(0) var<storage, read> input: array<f32>;
-                @group(0) @binding(1) var<storage, read_write> output: array<vec2<f32>>;
+            @group(0) @binding(0) var<storage, read_write> noiseProfile: array<f32>;
+            @group(0) @binding(1) var<storage, read> fftBuffer: array<vec2<f32>>;
+            @group(0) @binding(2) var<storage, read_write> processedFFTBuffer: array<vec2<f32>>;
 
-                const FFT_SIZE: u32 = ${FFT_SIZE};
-                const PI: f32 = 3.14159265359;
+            const FFT_SIZE: u32 = ${FFT_SIZE};
+            const PI: f32 = 3.14159265359;
 
-                @compute @workgroup_size(64)
-                fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
-                    let k = global_id.x;
-                    if (k >= FFT_SIZE) {
-                        return;
-                    }
-
-                    var sum_real: f32 = 0.0;
-                    var sum_imag: f32 = 0.0;
-
-                    for (var n: u32 = 0; n < FFT_SIZE; n = n + 1) {
-                        let angle = -2.0 * PI * f32(k) * f32(n) / f32(FFT_SIZE);
-                        sum_real = sum_real + input[n] * cos(angle);
-                        sum_imag = sum_imag + input[n] * sin(angle);
-                    }
-
-                    output[k] = vec2<f32>(sum_real, sum_imag);
+            @compute @workgroup_size(64)
+            fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
+                let k = global_id.x;
+                if (k >= FFT_SIZE) {
+                    return;
                 }
+
+                let noiseMagnitude = noiseProfile[k];
+                let signalMagnitude = length(fftBuffer[k]);
+                var gain = 0.2; // default to noise
+                if (signalMagnitude > noiseMagnitude) {
+                    gain = 1;
+                }
+
+                processedFFTBuffer[k] = fftBuffer[k] * gain;
+            }
             `;
 
             try {
