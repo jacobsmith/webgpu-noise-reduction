@@ -196,16 +196,19 @@
         let renderPipeline = null;
         let fftPipeline = null;
         let scrollPipeline = null;
+        let noiseReductionPipeline = null;
 
         let audioContext = null;
         let analyserNode = null;
         let micStream = null;
         let audioDataArray = null;
+        let noiseProfile = null;
 
         let inputWaterfallTexture = null;
         let outputWaterfallTexture = null;
         let audioBuffer = null;
         let fftBuffer = null;
+        let processedFFTBuffer = null;
         let inputParamsBuffer = null;
         let outputParamsBuffer = null;
 
@@ -296,6 +299,16 @@
                 usage: GPUBufferUsage.STORAGE
             });
 
+            processedFFTBuffer = device.createBuffer({
+                size: FFT_SIZE * 2 * 4, // Complex numbers (real, imag)
+                usage: GPUBufferUsage.STORAGE,
+            });
+
+            noiseProfile = device.createBuffer({
+                size: WATERFALL_WIDTH * 4, // 4 bytes per f32
+                usage: GPUBufferUsage.STORAGE,
+            });
+
             inputParamsBuffer = device.createBuffer({
                 size: 4, // u32 for current row
                 usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST
@@ -327,6 +340,7 @@
 
             // Create pipelines
             await createFFTPipeline();
+            await createNoiseReductionPipeline();
             await createScrollPipeline();
             await createRenderPipeline();
         }
@@ -377,6 +391,53 @@
                 console.error('FFT pipeline creation error:', error);
                 throw error;
             }
+        }
+
+        async function createNoiseReductionPipeline() {
+            const noiseReductionShader = `
+                @group(0) @binding(0) var<storage, read> input: array<f32>;
+                @group(0) @binding(1) var<storage, read_write> output: array<vec2<f32>>;
+
+                const FFT_SIZE: u32 = ${FFT_SIZE};
+                const PI: f32 = 3.14159265359;
+
+                @compute @workgroup_size(64)
+                fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
+                    let k = global_id.x;
+                    if (k >= FFT_SIZE) {
+                        return;
+                    }
+
+                    var sum_real: f32 = 0.0;
+                    var sum_imag: f32 = 0.0;
+
+                    for (var n: u32 = 0; n < FFT_SIZE; n = n + 1) {
+                        let angle = -2.0 * PI * f32(k) * f32(n) / f32(FFT_SIZE);
+                        sum_real = sum_real + input[n] * cos(angle);
+                        sum_imag = sum_imag + input[n] * sin(angle);
+                    }
+
+                    output[k] = vec2<f32>(sum_real, sum_imag);
+                }
+            `;
+
+            try {
+                const module = device.createShaderModule({ code: noiseReductionShader });
+                console.log('Noise Reduction shader module created');
+
+                noiseReductionPipeline = device.createComputePipeline({
+                    layout: 'auto',
+                    compute: {
+                        module,
+                        entryPoint: 'main'
+                    }
+                });
+                console.log('Noise Reduction pipeline created');
+            } catch (error) {
+                console.error('Noise Reduction pipeline creation error:', error);
+                throw error;
+            }
+
         }
 
         async function createScrollPipeline() {
@@ -615,6 +676,20 @@
             fftPass.setBindGroup(0, fftBindGroup);
             fftPass.dispatchWorkgroups(Math.ceil(FFT_SIZE / 64));
             fftPass.end();
+
+            const noiseReductionPass = commandEncoder.beginComputePass();
+            noiseReductionPass.setPipeline(noiseReductionPipeline);
+            const noiseBindGroup = device.createBindGroup({
+                layout: noiseReductionPipeline.getBindGroupLayout(0),
+                entries: [
+                    { binding: 0, resource: { buffer: noiseProfile }},
+                    { binding: 1, resource: { buffer: fftBuffer }},
+                    { binding: 2, resource: { buffer: processedFFTBuffer }}
+                ]
+            });
+            noiseReductionPass.setBindGroup(0, noiseBindGroup);
+            noiseReductionPass.dispatchWorkgroups(Math.ceil(FFT_SIZE / 64));
+            noiseReductionPass.end();
 
             // Update input waterfall texture
             const scrollPass = commandEncoder.beginComputePass();
