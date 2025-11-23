@@ -357,8 +357,13 @@
 
             noiseProfile = device.createBuffer({
                 size: WATERFALL_WIDTH * 4, // 4 bytes per f32
-                usage: GPUBufferUsage.STORAGE,
+                usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
             });
+
+            // Initialize noise profile with high values for minimum statistics
+            const initNoiseProfile = new Float32Array(WATERFALL_WIDTH);
+            initNoiseProfile.fill(1000.0); // Start high, will decrease to actual noise floor
+            device.queue.writeBuffer(noiseProfile, 0, initNoiseProfile);
 
             inputParamsBuffer = device.createBuffer({
                 size: 4, // u32 for current row
@@ -458,7 +463,9 @@
             @group(0) @binding(2) var<storage, read_write> processedFFTBuffer: array<vec2<f32>>;
 
             const FFT_SIZE: u32 = ${FFT_SIZE};
-            const PI: f32 = 3.14159265359;
+            const WATERFALL_WIDTH: u32 = ${WATERFALL_WIDTH};
+            const NOISE_GAIN: f32 = ${NOISE_GAIN};
+            const SIGNAL_GAIN: f32 = ${SIGNAL_GAIN};
 
             @compute @workgroup_size(64)
             fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
@@ -467,11 +474,18 @@
                     return;
                 }
 
-                let noiseMagnitude = noiseProfile[k];
-                let signalMagnitude = length(fftBuffer[k]);
-                var gain = ${NOISE_GAIN}; // default to noise
-                if (signalMagnitude > noiseMagnitude) {
-                    gain = ${SIGNAL_GAIN};
+                var gain = SIGNAL_GAIN;
+
+                // Only apply noise reduction to speech frequency range
+                if (k < WATERFALL_WIDTH) {
+                    let noiseMagnitude = noiseProfile[k];
+                    let signalMagnitude = length(fftBuffer[k]);
+
+                    if (signalMagnitude > noiseMagnitude) {
+                        gain = SIGNAL_GAIN;
+                    } else {
+                        gain = NOISE_GAIN;
+                    }
                 }
 
                 processedFFTBuffer[k] = fftBuffer[k] * gain;
@@ -549,22 +563,22 @@
             @group(0) @binding(0) var<storage, read_write> noiseProfile: array<f32>;
             @group(0) @binding(1) var<storage, read> fftBuffer: array<vec2<f32>>;
 
-            const FFT_SIZE: u32 = ${FFT_SIZE};
-            const PI: f32 = 3.14159265359;
+            const WATERFALL_WIDTH: u32 = ${WATERFALL_WIDTH};
+            const ALPHA: f32 = ${ALPHA_DECAY};
 
             @compute @workgroup_size(64)
             fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
                 let k = global_id.x;
-                if (k >= FFT_SIZE) {
+                if (k >= WATERFALL_WIDTH) {
                     return;
                 }
 
                 let currentMagnitude = length(fftBuffer[k]);
 
                 if (currentMagnitude < noiseProfile[k]) {
-                    noiseProfile[k] = currentMagnitude;  
+                    noiseProfile[k] = currentMagnitude;
                 } else {
-                    noiseProfile[k] = noiseProfile[k] * (1.0 - ${ALPHA_DECAY}) + currentMagnitude * ${ALPHA_DECAY}; 
+                    noiseProfile[k] = noiseProfile[k] * (1.0 - ALPHA) + currentMagnitude * ALPHA;
                 }
             }
             `;
@@ -1224,7 +1238,8 @@
 
         // GPU-BASED AUDIO PROCESSING
         async function processAudioBuffer(inputData) {
-            console.log('Processing audio with GPU noise reduction...');
+            console.log('=== GPU NOISE REDUCTION START ===');
+            console.log(`Parameters: Noise Gain=${NOISE_GAIN}, Signal Gain=${SIGNAL_GAIN}, Alpha=${ALPHA_DECAY}`);
 
             // Split input into chunks
             const chunks = [];
@@ -1274,7 +1289,7 @@
                     ]
                 });
                 noiseUpdatePass.setBindGroup(0, noiseUpdateBindGroup);
-                noiseUpdatePass.dispatchWorkgroups(Math.ceil(FFT_SIZE / 64));
+                noiseUpdatePass.dispatchWorkgroups(Math.ceil(WATERFALL_WIDTH / 64));
                 noiseUpdatePass.end();
 
                 // 3. Noise reduction: apply noise profile
@@ -1343,7 +1358,16 @@
                 offset += chunk.length;
             }
 
-            console.log('GPU processing complete!');
+            console.log('=== GPU NOISE REDUCTION COMPLETE ===');
+            console.log(`Processed ${chunks.length} chunks`);
+
+            // Log sample comparison
+            const inputSample = inputData.slice(0, 10);
+            const outputSample = outputData.slice(0, 10);
+            console.log('Input sample:', inputSample);
+            console.log('Output sample:', outputSample);
+            console.log('Difference:', outputSample.map((v, i) => Math.abs(v - inputSample[i])));
+
             return outputData;
         }
 
