@@ -622,11 +622,11 @@
                     let complex = magnitudes[x];
                     let magnitude = sqrt(complex.x * complex.x + complex.y * complex.y);
 
-                    // Apply log scale for better visualization
-                    // Scale up the magnitude significantly before log
-                    let scaled = magnitude * 0.1;
-                    let normalized = log(1.0 + scaled) / log(100.0);
-                    let clamped = clamp(normalized, 0.0, 1.0);
+                    // Apply log scale for better visualization with higher contrast
+                    let scaled = magnitude * 2.0;  // Increased from 0.1 for brightness
+                    let logValue = log(1.0 + scaled) / log(10.0);  // Smaller base for more contrast
+                    let boosted = pow(logValue, 0.7);  // Gamma correction to brighten mid-tones
+                    let clamped = clamp(boosted, 0.0, 1.0);
 
                     let row = params.currentRow % HEIGHT;
                     // Store in red channel, green=0, blue=0, alpha=1
