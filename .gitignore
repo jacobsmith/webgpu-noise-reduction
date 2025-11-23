@@ -7,9 +7,6 @@ __pycache__/
 # Environment variables
 .env
 
-# Test datasets
-test-audio-dataset/
-
 # OS
 .DS_Store
 Thumbs.db
