@@ -199,6 +199,7 @@
         let outputContext = null;
         let renderPipeline = null;
         let fftPipeline = null;
+        let ifftPipeline = null;
         let scrollPipeline = null;
         let noiseReductionPipeline = null;
         let updateNoisePipeline = null;
@@ -214,6 +215,7 @@
         let audioBuffer = null;
         let fftBuffer = null;
         let processedFFTBuffer = null;
+        let processedAudioBuffer = null;
         let inputParamsBuffer = null;
         let outputParamsBuffer = null;
 
@@ -309,6 +311,11 @@
                 usage: GPUBufferUsage.STORAGE,
             });
 
+            processedAudioBuffer = device.createBuffer({
+                size: FFT_SIZE * 4, // Real floats
+                usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC
+            });
+
             noiseProfile = device.createBuffer({
                 size: WATERFALL_WIDTH * 4, // 4 bytes per f32
                 usage: GPUBufferUsage.STORAGE,
@@ -345,7 +352,9 @@
 
             // Create pipelines
             await createFFTPipeline();
+            await createIFFTPipeline();
             await createNoiseReductionPipeline();
+            await createUpdateNoisePipeline();
             await createScrollPipeline();
             await createRenderPipeline();
         }
@@ -448,11 +457,58 @@
             }
         }
 
+        async function createIFFTPipeline() {
+            const ifftShader = `
+                @group(0) @binding(0) var<storage, read> input: array<vec2<f32>>;
+                @group(0) @binding(1) var<storage, read_write> output: array<f32>;
+
+                const FFT_SIZE: u32 = ${FFT_SIZE};
+                const PI: f32 = 3.14159265359;
+
+                @compute @workgroup_size(64)
+                fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
+                    let n = global_id.x;
+                    if (n >= FFT_SIZE) {
+                        return;
+                    }
+
+                    var sum_real: f32 = 0.0;
+                    var sum_imag: f32 = 0.0;
+
+                    for (var k: u32 = 0; k < FFT_SIZE; k = k + 1) {
+                        let angle = 2.0 * PI * f32(k) * f32(n) / f32(FFT_SIZE);
+                        let complex = input[k];
+
+                        sum_real += complex.x * cos(angle) - complex.y * sin(angle);
+                        sum_imag += complex.x * sin(angle) + complex.y * cos(angle);
+                    }
+
+                    output[n] = sum_real / f32(FFT_SIZE);
+                }
+            `;
+
+            try {
+                const module = device.createShaderModule({ code: ifftShader });
+                console.log('IFFT shader module created');
+
+                ifftPipeline = device.createComputePipeline({
+                    layout: 'auto',
+                    compute: {
+                        module,
+                        entryPoint: 'main'
+                    }
+                });
+                console.log('IFFT pipeline created');
+            } catch (error) {
+                console.error('IFFT pipeline creation error:', error);
+                throw error;
+            }
+        }
+
         async function createUpdateNoisePipeline() {
             const updateNoiseShader = `
             @group(0) @binding(0) var<storage, read_write> noiseProfile: array<f32>;
             @group(0) @binding(1) var<storage, read> fftBuffer: array<vec2<f32>>;
-            @group(0) @binding(2) var<storage, read_write> processedFFTBuffer: array<vec2<f32>>;
 
             const FFT_SIZE: u32 = ${FFT_SIZE};
             const PI: f32 = 3.14159265359;
@@ -1125,17 +1181,129 @@
             device.queue.submit([inputEncoder.finish()]);
         }
 
-        // PLACEHOLDER AUDIO PROCESSING FUNCTION
-        // Replace this with your own audio processing algorithm
-        function processAudioBuffer(inputData) {
-            // For now, just copy the input to output
-            // You can replace this with any processing you want:
-            // - Noise reduction
-            // - Equalization
-            // - Compression
-            // - etc.
-            console.log('Processing audio... (currently just copying input to output)');
-            return new Float32Array(inputData);
+        // GPU-BASED AUDIO PROCESSING
+        async function processAudioBuffer(inputData) {
+            console.log('Processing audio with GPU noise reduction...');
+
+            // Split input into chunks
+            const chunks = [];
+            for (let i = 0; i < inputData.length; i += FFT_SIZE) {
+                const chunk = inputData.slice(i, i + FFT_SIZE);
+                if (chunk.length === FFT_SIZE) {
+                    chunks.push(chunk);
+                }
+            }
+
+            const processedChunks = [];
+
+            // Process each chunk through the GPU pipeline
+            for (let i = 0; i < chunks.length; i++) {
+                const chunk = chunks[i];
+
+                // Upload chunk to GPU
+                device.queue.writeBuffer(audioBuffer, 0, chunk);
+
+                // Create command encoder for this chunk
+                const commandEncoder = device.createCommandEncoder();
+
+                // 1. FFT: time → frequency
+                const fftPass = commandEncoder.beginComputePass();
+                fftPass.setPipeline(fftPipeline);
+                const fftBindGroup = device.createBindGroup({
+                    label: 'fftBindGroup',
+                    layout: fftPipeline.getBindGroupLayout(0),
+                    entries: [
+                        { binding: 0, resource: { buffer: audioBuffer } },
+                        { binding: 1, resource: { buffer: fftBuffer } }
+                    ]
+                });
+                fftPass.setBindGroup(0, fftBindGroup);
+                fftPass.dispatchWorkgroups(Math.ceil(FFT_SIZE / 64));
+                fftPass.end();
+
+                // 2. Update noise profile (minimum statistics)
+                const noiseUpdatePass = commandEncoder.beginComputePass();
+                noiseUpdatePass.setPipeline(updateNoisePipeline);
+                const noiseUpdateBindGroup = device.createBindGroup({
+                    label: 'noiseUpdateBindGroup',
+                    layout: updateNoisePipeline.getBindGroupLayout(0),
+                    entries: [
+                        { binding: 0, resource: { buffer: noiseProfile } },
+                        { binding: 1, resource: { buffer: fftBuffer } },
+                    ]
+                });
+                noiseUpdatePass.setBindGroup(0, noiseUpdateBindGroup);
+                noiseUpdatePass.dispatchWorkgroups(Math.ceil(FFT_SIZE / 64));
+                noiseUpdatePass.end();
+
+                // 3. Noise reduction: apply noise profile
+                const noiseReductionPass = commandEncoder.beginComputePass();
+                noiseReductionPass.setPipeline(noiseReductionPipeline);
+                const noiseReductionBindGroup = device.createBindGroup({
+                    label: 'noiseReductionBindGroup',
+                    layout: noiseReductionPipeline.getBindGroupLayout(0),
+                    entries: [
+                        { binding: 0, resource: { buffer: noiseProfile } },
+                        { binding: 1, resource: { buffer: fftBuffer } },
+                        { binding: 2, resource: { buffer: processedFFTBuffer } }
+                    ]
+                });
+                noiseReductionPass.setBindGroup(0, noiseReductionBindGroup);
+                noiseReductionPass.dispatchWorkgroups(Math.ceil(FFT_SIZE / 64));
+                noiseReductionPass.end();
+
+                // 4. IFFT: frequency → time
+                const ifftPass = commandEncoder.beginComputePass();
+                ifftPass.setPipeline(ifftPipeline);
+                const ifftBindGroup = device.createBindGroup({
+                    label: 'iFFTBindGroup',
+                    layout: ifftPipeline.getBindGroupLayout(0),
+                    entries: [
+                        { binding: 0, resource: { buffer: processedFFTBuffer } },
+                        { binding: 1, resource: { buffer: processedAudioBuffer } }
+                    ]
+                });
+                ifftPass.setBindGroup(0, ifftBindGroup);
+                ifftPass.dispatchWorkgroups(Math.ceil(FFT_SIZE / 64));
+                ifftPass.end();
+
+                // Submit GPU commands
+                device.queue.submit([commandEncoder.finish()]);
+
+                // Read back processed audio from GPU
+                const readBuffer = device.createBuffer({
+                    size: FFT_SIZE * 4,
+                    usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ
+                });
+
+                const copyEncoder = device.createCommandEncoder();
+                copyEncoder.copyBufferToBuffer(processedAudioBuffer, 0, readBuffer, 0, FFT_SIZE * 4);
+                device.queue.submit([copyEncoder.finish()]);
+
+                // Wait for GPU to finish and map the buffer
+                await readBuffer.mapAsync(GPUMapMode.READ);
+                const processedChunk = new Float32Array(readBuffer.getMappedRange()).slice();
+                readBuffer.unmap();
+
+                processedChunks.push(processedChunk);
+
+                // Progress update
+                if (i % 10 === 0) {
+                    console.log(`Processed ${i}/${chunks.length} chunks`);
+                }
+            }
+
+            // Concatenate all processed chunks
+            const totalSamples = processedChunks.reduce((sum, chunk) => sum + chunk.length, 0);
+            const outputData = new Float32Array(totalSamples);
+            let offset = 0;
+            for (const chunk of processedChunks) {
+                outputData.set(chunk, offset);
+                offset += chunk.length;
+            }
+
+            console.log('GPU processing complete!');
+            return outputData;
         }
 
         async function processRecording() {
@@ -1158,8 +1326,8 @@
 
             console.log(`Processing ${totalSamples} samples (${(totalSamples / SAMPLE_RATE).toFixed(2)} seconds)`);
 
-            // Process the audio (placeholder - just copies for now)
-            const outputData = processAudioBuffer(inputData);
+            // Process the audio through GPU pipeline
+            const outputData = await processAudioBuffer(inputData);
 
             // Split output back into chunks for visualization
             recordedOutputChunks = [];
