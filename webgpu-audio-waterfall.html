@@ -190,6 +190,10 @@
         const FREQ_PER_BIN = SAMPLE_RATE / FFT_SIZE; // ~86 Hz per bin
         const WATERFALL_WIDTH = Math.floor(MAX_DISPLAY_FREQ / FREQ_PER_BIN); // ~186 bins for 0-8kHz
 
+        const NOISE_GAIN = 0.2;
+        const SIGNAL_GAIN = 1;
+        const ALPHA_DECAY = 0.01;
+
         let device = null;
         let inputContext = null;
         let outputContext = null;
@@ -197,6 +201,7 @@
         let fftPipeline = null;
         let scrollPipeline = null;
         let noiseReductionPipeline = null;
+        let updateNoisePipeline = null;
 
         let audioContext = null;
         let analyserNode = null;
@@ -416,9 +421,9 @@
 
                 let noiseMagnitude = noiseProfile[k];
                 let signalMagnitude = length(fftBuffer[k]);
-                var gain = 0.2; // default to noise
+                var gain = ${NOISE_GAIN}; // default to noise
                 if (signalMagnitude > noiseMagnitude) {
-                    gain = 1;
+                    gain = ${SIGNAL_GAIN};
                 }
 
                 processedFFTBuffer[k] = fftBuffer[k] * gain;
@@ -441,7 +446,50 @@
                 console.error('Noise Reduction pipeline creation error:', error);
                 throw error;
             }
+        }
 
+        async function createUpdateNoisePipeline() {
+            const updateNoiseShader = `
+            @group(0) @binding(0) var<storage, read_write> noiseProfile: array<f32>;
+            @group(0) @binding(1) var<storage, read> fftBuffer: array<vec2<f32>>;
+            @group(0) @binding(2) var<storage, read_write> processedFFTBuffer: array<vec2<f32>>;
+
+            const FFT_SIZE: u32 = ${FFT_SIZE};
+            const PI: f32 = 3.14159265359;
+
+            @compute @workgroup_size(64)
+            fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
+                let k = global_id.x;
+                if (k >= FFT_SIZE) {
+                    return;
+                }
+
+                let currentMagnitude = length(fftBuffer[k]);
+
+                if (currentMagnitude < noiseProfile[k]) {
+                    noiseProfile[k] = currentMagnitude;  
+                } else {
+                    noiseProfile[k] = noiseProfile[k] * (1.0 - ${ALPHA_DECAY}) + currentMagnitude * ${ALPHA_DECAY}; 
+                }
+            }
+            `;
+
+            try {
+                const module = device.createShaderModule({ code: updateNoiseShader });
+                console.log('Update Noise shader module created');
+
+                updateNoisePipeline = device.createComputePipeline({
+                    layout: 'auto',
+                    compute: {
+                        module,
+                        entryPoint: 'main'
+                    }
+                });
+                console.log('Update Noise pipeline created');
+            } catch (error) {
+                console.error('Update Noise pipeline creation error:', error);
+                throw error;
+            }
         }
 
         async function createScrollPipeline() {
@@ -680,6 +728,21 @@
             fftPass.setBindGroup(0, fftBindGroup);
             fftPass.dispatchWorkgroups(Math.ceil(FFT_SIZE / 64));
             fftPass.end();
+
+            const updateNoisePass = commandEncoder.beginComputePass();
+            updateNoisePass.setPipeline(updateNoisePipeline);
+            const updateNoiseBindGroup = device.createBindGroup({
+                layout: updateNoisePipeline.getBindGroupLayout(0),
+                entries: [
+                    { binding: 0, resource: { buffer: noiseProfile }},
+                    { binding: 1, resource: { buffer: fftBuffer }},
+                    { binding: 2, resource: { buffer: processedFFTBuffer }}
+                ]
+            });
+            updateNoisePass.setBindGroup(0, updateNoiseBindGroup);
+            updateNoisePass.dispatchWorkgroups(Math.ceil(FFT_SIZE / 64));
+            updateNoisePass.end();
+
 
             const noiseReductionPass = commandEncoder.beginComputePass();
             noiseReductionPass.setPipeline(noiseReductionPipeline);
