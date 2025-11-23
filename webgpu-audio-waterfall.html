@@ -232,6 +232,7 @@
         let NOISE_GAIN = 0.2;
         let SIGNAL_GAIN = 1.0;
         let ALPHA_DECAY = 0.01;
+        let NOISE_SUPRESSION_FACTOR = 3;
 
         let device = null;
         let inputContext = null;
@@ -342,7 +343,7 @@
 
             fftBuffer = device.createBuffer({
                 size: FFT_SIZE * 2 * 4, // Complex numbers (real, imag)
-                usage: GPUBufferUsage.STORAGE
+                usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC
             });
 
             processedFFTBuffer = device.createBuffer({
@@ -357,13 +358,14 @@
 
             noiseProfile = device.createBuffer({
                 size: WATERFALL_WIDTH * 4, // 4 bytes per f32
-                usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+                usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC,
             });
 
             // Initialize noise profile with high values for minimum statistics
             const initNoiseProfile = new Float32Array(WATERFALL_WIDTH);
             initNoiseProfile.fill(1000.0); // Start high, will decrease to actual noise floor
             device.queue.writeBuffer(noiseProfile, 0, initNoiseProfile);
+            console.log('Noise profile initialized with values:', initNoiseProfile.slice(0, 5), '... (total:', WATERFALL_WIDTH, 'bins)');
 
             inputParamsBuffer = device.createBuffer({
                 size: 4, // u32 for current row
@@ -466,6 +468,7 @@
             const WATERFALL_WIDTH: u32 = ${WATERFALL_WIDTH};
             const NOISE_GAIN: f32 = ${NOISE_GAIN};
             const SIGNAL_GAIN: f32 = ${SIGNAL_GAIN};
+            const NOISE_SUPRESSION_FACTOR: f32 = ${NOISE_SUPRESSION_FACTOR};
 
             @compute @workgroup_size(64)
             fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
@@ -474,21 +477,15 @@
                     return;
                 }
 
-                var gain = SIGNAL_GAIN;
-
                 // Only apply noise reduction to speech frequency range
                 if (k < WATERFALL_WIDTH) {
                     let noiseMagnitude = noiseProfile[k];
                     let signalMagnitude = length(fftBuffer[k]);
 
-                    if (signalMagnitude > noiseMagnitude) {
-                        gain = SIGNAL_GAIN;
-                    } else {
-                        gain = NOISE_GAIN;
-                    }
+                    let cleanMagnitude = max(0.0, signalMagnitude - NOISE_SUPRESSION_FACTOR * noiseMagnitude);
+                    let gain = cleanMagnitude / max(signalMagnitude, 0.001);
+                    processedFFTBuffer[k] = fftBuffer[k] * gain;
                 }
-
-                processedFFTBuffer[k] = fftBuffer[k] * gain;
             }
             `;
 
@@ -1344,8 +1341,47 @@
                 processedChunks.push(processedChunk);
 
                 // Progress update
-                if (i % 10 === 0) {
-                    console.log(`Processed ${i}/${chunks.length} chunks`);
+                // if (i % 10 === 0) {
+                //     console.log(`Processed ${i}/${chunks.length} chunks`);
+                // }
+
+                // Debug: Check noise profile and FFT magnitudes at multiple time points
+                // At 44100 Hz with 1024 chunk size: ~215 chunks = 5sec, ~258 = 6sec, ~301 = 7sec
+                if (i === 215 || i === 258 || i === 301) {
+                    const timeSeconds = (i * FFT_SIZE / SAMPLE_RATE).toFixed(1);
+                    console.log(`\n=== DIAGNOSTIC at ${timeSeconds}s (chunk ${i}) ===`);
+                    setTimeout(async () => {
+                        await debugNoiseProfile();
+
+                        // Also read back FFT buffer to compare magnitudes
+                        const fftReadBuffer = device.createBuffer({
+                            size: WATERFALL_WIDTH * 2 * 4, // Complex numbers
+                            usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ
+                        });
+                        const cmdEnc = device.createCommandEncoder();
+                        cmdEnc.copyBufferToBuffer(fftBuffer, 0, fftReadBuffer, 0, WATERFALL_WIDTH * 2 * 4);
+                        device.queue.submit([cmdEnc.finish()]);
+                        await fftReadBuffer.mapAsync(GPUMapMode.READ);
+                        const fftData = new Float32Array(fftReadBuffer.getMappedRange());
+
+                        // Calculate magnitudes
+                        const magnitudes = [];
+                        for (let k = 0; k < WATERFALL_WIDTH; k++) {
+                            const real = fftData[k * 2];
+                            const imag = fftData[k * 2 + 1];
+                            magnitudes.push(Math.sqrt(real * real + imag * imag));
+                        }
+
+                        console.log('FFT MAGNITUDES:');
+                        console.log('  Bins 0-9 (0-430 Hz):', magnitudes.slice(0, 10));
+                        console.log('  Bins 10-19 (430-860 Hz - speech):', magnitudes.slice(10, 20));
+                        console.log('  Bins 30-39 (1290-1720 Hz - speech):', magnitudes.slice(30, 40));
+                        console.log('  Overall range:', Math.min(...magnitudes).toFixed(3), '-', Math.max(...magnitudes).toFixed(3));
+                        console.log('  Speech range (bins 10-50):',
+                            Math.min(...magnitudes.slice(10, 50)).toFixed(3), '-', Math.max(...magnitudes.slice(10, 50)).toFixed(3));
+
+                        fftReadBuffer.unmap();
+                    }, 100);
                 }
             }
 
@@ -1367,6 +1403,15 @@
             console.log('Input sample:', inputSample);
             console.log('Output sample:', outputSample);
             console.log('Difference:', outputSample.map((v, i) => Math.abs(v - inputSample[i])));
+
+            // Calculate RMS to detect if processing is working
+            const inputRMS = Math.sqrt(inputData.reduce((sum, v) => sum + v*v, 0) / inputData.length);
+            const outputRMS = Math.sqrt(outputData.reduce((sum, v) => sum + v*v, 0) / outputData.length);
+            console.log(`Input RMS: ${inputRMS.toFixed(6)}, Output RMS: ${outputRMS.toFixed(6)}, Ratio: ${(outputRMS/inputRMS).toFixed(3)}`);
+
+            if (Math.abs(outputRMS - inputRMS) < 0.0001) {
+                console.warn('⚠️ WARNING: Output is nearly identical to input! Noise reduction may not be working.');
+            }
 
             return outputData;
         }
@@ -1583,6 +1628,34 @@
 
             updateParamDisplay();
             showStatus('Parameters reset to defaults. Click "Apply Parameters" to use them.');
+        }
+
+        async function debugNoiseProfile() {
+            if (!device || !noiseProfile) {
+                console.error('Device or noise profile not initialized');
+                return;
+            }
+
+            // Read back noise profile from GPU
+            const readBuffer = device.createBuffer({
+                size: WATERFALL_WIDTH * 4,
+                usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ
+            });
+
+            const commandEncoder = device.createCommandEncoder();
+            commandEncoder.copyBufferToBuffer(noiseProfile, 0, readBuffer, 0, WATERFALL_WIDTH * 4);
+            device.queue.submit([commandEncoder.finish()]);
+
+            await readBuffer.mapAsync(GPUMapMode.READ);
+            const data = new Float32Array(readBuffer.getMappedRange());
+
+            console.log('NOISE PROFILE:');
+            console.log('  Bins 0-9:', Array.from(data.slice(0, 10)).map(v => v.toFixed(3)));
+            console.log('  Bins 10-19:', Array.from(data.slice(10, 20)).map(v => v.toFixed(3)));
+            console.log('  Range:', Math.min(...data).toFixed(3), '-', Math.max(...data).toFixed(3));
+            console.log('  Average:', (data.reduce((a, b) => a + b, 0) / data.length).toFixed(3));
+
+            readBuffer.unmap();
         }
 
         function showStatus(message, isSuccess = false) {
