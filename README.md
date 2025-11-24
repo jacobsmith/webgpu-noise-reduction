@@ -2,7 +2,7 @@
 
 Real-time speech noise reduction using WebGPU compute shaders with spectral subtraction and dual waterfall visualization.
 
-**[Live Demo on GitHub Pages](https://[your-username].github.io/webgpu-noise-reduction/webgpu-audio-waterfall.html)** _(requires Chrome 113+ or Edge 113+)_
+**[Live Demo on GitHub Pages](https://jacobsmith.github.io/webgpu-noise-reduction/webgpu-audio-waterfall.html)** _(requires Chrome 113+ or Edge 113+)_
 
 ## Preamble
 
